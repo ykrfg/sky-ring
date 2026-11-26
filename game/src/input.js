@@ -1,53 +1,73 @@
-// Keyboard and pointer input. Held keys give a steering direction; one-shot presses (start or
-// restart, pause) are queued as bit flags and taken once by the loop, so a press between two
-// frames is never lost and never counted twice.
+// Keyboard and pointer input for the flight game.
+//
+// Two kinds of signal come out of here:
+//   down(key)    — is this key held right now (steering, throttle)
+//   take()       — the set of one-shot presses since the last call, drained by
+//                  the caller so a press between frames is never lost or
+//                  counted twice. Pointer taps on the menu buttons join the
+//                  same queue as pseudo-keys ('PointerStart', ...).
+// consume(key) is take() for a single key.
 
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
+import { VIEW } from './config.js';
 
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
+// Keys the game reacts to. Anything else keeps its default browser behaviour;
+// these are preventDefault()ed so arrows and space cannot scroll the page.
+const GAME_KEYS = new Set([
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'KeyW', 'KeyS', 'KeyG', 'KeyJ', 'KeyF', 'KeyC', 'KeyO', 'KeyR',
+  'Space', 'Enter', 'Escape',
+]);
 
-export function createInput(target) {
-  let left = false;
-  let right = false;
-  let actions = 0;
+export function createInput(canvas) {
+  const held = new Set();
+  let queued = new Set();
 
   window.addEventListener('keydown', (event) => {
-    if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else return;
+    if (!GAME_KEYS.has(event.code)) return;
     event.preventDefault();
+    held.add(event.code);
+    if (!event.repeat) queued.add(event.code);
   });
   window.addEventListener('keyup', (event) => {
-    if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
+    held.delete(event.code);
   });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
+  // A key released while the window is unfocused never fires keyup here.
   window.addEventListener('blur', () => {
-    left = false;
-    right = false;
+    held.clear();
+    queued.clear();
   });
-  target.addEventListener('pointerdown', () => {
-    actions |= ACTION_CONFIRM;
+
+  // Menu buttons are drawn on the HUD canvas in logical coordinates; map the
+  // tap back into that space and queue the matching pseudo-key. The boxes are
+  // [left, top, right, bottom] and must stay in step with the HUD layout.
+  const HIT_BOXES = [
+    ['PointerStart', 398, 512, 632, 564],
+    ['PointerCredits', 648, 512, 882, 564],
+    ['PointerAudio', 548, 578, 732, 614],
+  ];
+  window.addEventListener('pointerdown', (event) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * VIEW.width;
+    const y = ((event.clientY - rect.top) / rect.height) * VIEW.height;
+    for (const [key, left, top, right, bottom] of HIT_BOXES) {
+      if (x >= left && x <= right && y >= top && y <= bottom) {
+        queued.add(key);
+        break;
+      }
+    }
   });
 
   return {
-    /** -1 for left, 1 for right, 0 for neither or both. */
-    direction() {
-      return (right ? 1 : 0) - (left ? 1 : 0);
+    down: (key) => held.has(key),
+    consume: (key) => {
+      if (!queued.has(key)) return false;
+      queued.delete(key);
+      return true;
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
-    takeActions() {
-      const taken = actions;
-      actions = 0;
-      return taken;
+    take: () => {
+      const presses = queued;
+      queued = new Set();
+      return presses;
     },
   };
 }

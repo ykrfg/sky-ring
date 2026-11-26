@@ -2,18 +2,43 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Block Dodger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0d2438">
+<meta name="description" content="SKY RING: take off from the island runway, thread the numbered ring course and bring the Raven home. A WebGL flight game that runs entirely in the browser.">
+<title>SKY RING — ring course flight</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11141b; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  /* Read aloud, never shown: the status line screen readers announce. */
+  :root {
+    color-scheme: dark;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #0d2438;
+  }
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+  /* The stage gradient is what shows for the moment before the first frame renders. */
+  #stage { position: fixed; inset: 0; background: linear-gradient(#7fb8d8, #1a5d7c); }
+  #view, #hud { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+  #hud { pointer-events: auto; cursor: default; }
+  /* Announced by screen readers, never painted. */
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  #boot {
+    position: fixed; inset: auto 0 46%; text-align: center; pointer-events: none;
+    color: #eaf9ff; font: 600 14px ui-monospace, monospace; letter-spacing: 0.12em;
+    text-shadow: 0 2px 12px #07344a;
+  }
+  #boot[hidden] { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; }
+  }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Block Dodger: move the paddle left and right to dodge falling blocks and catch coins"></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<main id="stage" aria-label="SKY RING, a 3D flight game">
+  <canvas id="view" aria-hidden="true"></canvas>
+  <canvas id="hud" aria-label="Flight instruments and game controls"></canvas>
+  <div id="boot" aria-hidden="true">SPOOLING UP THE ENGINE</div>
+</main>
+<p id="status" role="status" aria-live="polite">Loading SKY RING.</p>
+<noscript><p style="text-align:center; color:#eaf9ff;">SKY RING needs JavaScript to fly.</p></noscript>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
