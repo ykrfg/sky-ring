@@ -14,9 +14,19 @@
   }
   * { box-sizing: border-box; }
   html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-  /* The stage gradient is what shows for the moment before the first frame renders. */
-  #stage { position: fixed; inset: 0; background: linear-gradient(#7fb8d8, #1a5d7c); }
-  #view, #hud { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+  /* The stage is a 16:9 box fitted inside the window and centred; whatever
+     window is left around it stays plain dark (letterbox / pillarbox), and
+     the picture inside is never stretched. Both canvases share the exact
+     same box, so the HUD layer always aligns with the WebGL layer. */
+  #stage { position: fixed; inset: 0; background: #050f18; }
+  #view, #hud {
+    position: absolute; left: 50%; top: 50%; display: block;
+    width: min(100vw, 177.78vh); height: min(56.25vw, 100vh);
+    /* Dynamic viewport units track the mobile browser chrome showing and
+       hiding; browsers without them keep the vh sizing above. */
+    width: min(100vw, 177.78dvh); height: min(56.25vw, 100dvh);
+    transform: translate(-50%, -50%);
+  }
   #hud { pointer-events: auto; cursor: default; }
   /* Announced by screen readers, never painted. */
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

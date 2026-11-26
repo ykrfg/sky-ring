@@ -249,6 +249,8 @@ function runGame(world, renderer) {
     };
 
     // Screen routing: Escape backs out first, then at most one transition.
+    // The end screens also take pointer taps: their drawn buttons queue
+    // PointerRetry / PointerTitle in the input layer, spent only here.
     if (pressed.has('Escape')) {
       if (state.phase === 'settings' || state.phase === 'credits') state.phase = 'title';
       else if (state.phase !== 'title') parkOnTitle();
@@ -266,7 +268,11 @@ function runGame(world, renderer) {
       && (pressed.has('Enter') || pressed.has('Space') || pressed.has('PointerStart'))) {
       beginRun();
     } else if ((state.phase === 'result' || state.phase === 'crashed')
-      && (pressed.has('Enter') || pressed.has('Space') || pressed.has('PointerStart'))) {
+      && pressed.has('PointerTitle')) {
+      parkOnTitle();
+    } else if ((state.phase === 'result' || state.phase === 'crashed')
+      && (pressed.has('Enter') || pressed.has('Space')
+        || pressed.has('PointerStart') || pressed.has('PointerRetry'))) {
       beginRun();
     }
 

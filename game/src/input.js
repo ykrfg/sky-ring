@@ -14,7 +14,7 @@
 // stays down, plus one queued press so one-shot actions (gear, fire) fire.
 
 import { VIEW } from './config.js';
-import { TOUCH_ZONES } from './render.js';
+import { END_BUTTONS, TOUCH_ZONES } from './render.js';
 
 // Keys the game reacts to. Anything else keeps its default browser behaviour;
 // these are preventDefault()ed so arrows and space cannot scroll the page.
@@ -79,6 +79,18 @@ export function createInput(canvas) {
     for (const [key, left, top, right, bottom] of HIT_BOXES) {
       if (x >= left && x <= right && y >= top && y <= bottom) {
         queued.add(key);
+        break;
+      }
+    }
+    // The end screens' buttons: the rectangles come from render.js's
+    // END_BUTTONS table — the same numbers that draw them — so a tap lands
+    // on the button the player sees. The queue is drained every frame and
+    // the main loop only spends these pseudo-keys on the result and crash
+    // screens, so a tap that queues one anywhere else is simply dropped.
+    for (const button of END_BUTTONS) {
+      if (x >= button.x && x <= button.x + button.w
+        && y >= button.y && y <= button.y + button.h) {
+        queued.add(button.key);
         break;
       }
     }

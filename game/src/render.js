@@ -44,6 +44,21 @@ export const TOUCH_ZONES = [
 ];
 
 // ---------------------------------------------------------------------------
+// End-screen buttons (result and crash screens)
+// ---------------------------------------------------------------------------
+//
+// One table again: drawEndButtons paints these rectangles on both end
+// screens, and the input layer hit-tests the same rectangles, queueing the
+// pseudo-key each button stands in for ('PointerRetry' flies again,
+// 'PointerTitle' returns to the title). The row mirrors the title screen's
+// two main buttons, so the end screens feel like the same menu.
+
+export const END_BUTTONS = [
+  { key: 'PointerRetry', x: 398, y: 512, w: 234, h: 52 },
+  { key: 'PointerTitle', x: 648, y: 512, w: 234, h: 52 },
+];
+
+// ---------------------------------------------------------------------------
 // Shaders
 // ---------------------------------------------------------------------------
 
@@ -921,20 +936,20 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       width = VIEW.width;
       height = VIEW.height;
     } else {
+      // The stylesheet owns the display size: a 16:9 stage fitted inside
+      // the window and centred, with dark bars around it. The backbuffer
+      // follows the canvas's own CSS box (not the window), so the stage
+      // keeps its aspect at any window shape.
       const ratio = Math.min(window.devicePixelRatio || 1, RENDER.maxDpr);
-      width = Math.min(RENDER.maxWidth, Math.round(window.innerWidth * ratio));
-      height = Math.min(RENDER.maxHeight, Math.round(window.innerHeight * ratio));
+      const cssWidth = glCanvas.clientWidth || window.innerWidth;
+      const cssHeight = glCanvas.clientHeight || window.innerHeight;
+      width = Math.min(RENDER.maxWidth, Math.round(cssWidth * ratio));
+      height = Math.min(RENDER.maxHeight, Math.round(cssHeight * ratio));
     }
     glCanvas.width = width;
     hudCanvas.width = width;
     glCanvas.height = height;
     hudCanvas.height = height;
-    if (!options.fixedSize) {
-      glCanvas.style.width = `${window.innerWidth}px`;
-      hudCanvas.style.width = `${window.innerWidth}px`;
-      glCanvas.style.height = `${window.innerHeight}px`;
-      hudCanvas.style.height = `${window.innerHeight}px`;
-    }
     gl.viewport(0, 0, width, height);
     rebuildSceneTarget(width, height);
   }
@@ -1739,6 +1754,31 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     label('[ ESC / O ]  BACK', 640, 596, 12, '#8ff3ff', 'center', 700);
   }
 
+  // The two end-screen buttons, drawn from the shared END_BUTTONS table so
+  // what is painted is exactly what the input layer hit-tests. The retry
+  // button keeps the keyboard hint in its label, like the title buttons.
+  function drawEndButtons(retryText) {
+    const texts = [retryText, 'ESC  —  TITLE'];
+    END_BUTTONS.forEach((button, i) => {
+      const hovered = pointer.x > button.x && pointer.x < button.x + button.w
+        && pointer.y > button.y && pointer.y < button.y + button.h;
+      hud.fillStyle = hovered ? 'rgba(75,213,236,.20)' : 'rgba(7,24,35,.78)';
+      panelPath(button.x, button.y, button.w, button.h, 8);
+      hud.strokeStyle = hovered ? '#9ff7ff' : 'rgba(120,215,230,.5)';
+      hud.lineWidth = 1.5;
+      hud.beginPath();
+      hud.moveTo(button.x + 8, button.y);
+      hud.lineTo(button.x + button.w - 8, button.y);
+      hud.lineTo(button.x + button.w - 8, button.y + button.h);
+      hud.lineTo(button.x + 8, button.y + button.h);
+      hud.closePath();
+      hud.stroke();
+      label(texts[i], button.x + button.w / 2, button.y + 33, 14,
+        hovered ? '#ecfeff' : '#b9e9ef', 'center', 700,
+        hovered ? 'rgba(100,240,255,.55)' : null);
+    });
+  }
+
   function drawResultScreen(state) {
     hud.fillStyle = 'rgba(2,9,16,.76)';
     hud.fillRect(0, 0, VIEW.width, VIEW.height);
@@ -1771,8 +1811,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     hud.moveTo(390, 480);
     hud.lineTo(890, 480);
     hud.stroke();
-    label('ENTER  —  FLY AGAIN', 640, 520, 14, '#8ff3ff', 'center', 700, 'rgba(100,230,250,.5)');
-    label('ESC  —  TITLE', 640, 548, 10, '#6f959e', 'center', 500);
+    drawEndButtons('ENTER  —  FLY AGAIN');
   }
 
   function drawCrashScreen(state) {
@@ -1785,8 +1824,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     hud.fillRect(0, 0, VIEW.width, VIEW.height);
     label('FLIGHT LOST', 640, 250, 52, '#ffd8cb', 'center', 800, 'rgba(255,90,60,.55)');
     label(state.crashReason, 640, 304, 18, '#ff9e88', 'center', 700, 'rgba(255,80,50,.4)');
-    label('ENTER  —  TRY AGAIN', 640, 584, 15, '#ffd2a2', 'center', 700, 'rgba(2,5,8,.9)');
-    label('ESC  —  TITLE', 640, 612, 10, '#c9a092', 'center', 500, 'rgba(2,5,8,.9)');
+    drawEndButtons('ENTER  —  TRY AGAIN');
   }
 
   function drawHud(state, vp, camera, cam) {
