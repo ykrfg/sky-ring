@@ -1,5 +1,6 @@
 [
-  { "name": "1-start.jpg", "query": "?shot=start&seed=1" },
-  { "name": "2-play.jpg", "query": "?shot=play&seed=1" },
-  { "name": "3-end.jpg", "query": "?shot=end&seed=1" }
+  { "name": "1-missile.jpg", "query": "?scene=missile&seed=1" },
+  { "name": "2-ring.jpg", "query": "?scene=ring&seed=1" },
+  { "name": "3-landing.jpg", "query": "?scene=landing&seed=1" },
+  { "name": "4-title.jpg", "query": "?scene=title&seed=1" }
 ]
