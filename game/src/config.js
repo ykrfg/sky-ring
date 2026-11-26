@@ -95,9 +95,13 @@ export const PALETTE = {
   fog: [0.55, 0.71, 0.77],
 };
 
-// Sound files under game/audio. BGM is delivered separately and may be missing
-// while developing, so it gets its own path constant instead of an AUDIO entry.
-export const BGM_PATH = 'audio/bgm.ogg';
+// Sound files under game/audio. The music lives outside the AUDIO map because
+// there are two tracks and main.js crossfades between them by phase: the title
+// track under the menu screens, the flight track once the sortie starts.
+export const BGM = {
+  title: 'audio/bgm_title.ogg',
+  flight: 'audio/bgm_ingame.ogg',
+};
 export const AUDIO = {
   engine: 'audio/engine-loop.ogg',
   missile: 'audio/missile.ogg',
