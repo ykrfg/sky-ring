@@ -9,6 +9,6 @@ All sound effects in this folder are **CC0 1.0 (public domain)** — free for co
 | `lockon.ogg` | Lock-on confirm tone | Kenney "Digital Audio" pack (`highUp.ogg`) — https://kenney.nl/assets/digital-audio |
 | `ring.ogg` | Target-ring pass chime | Kenney "Music Jingles" pack (`jingles_PIZZI00.ogg`) — https://kenney.nl/assets/music-jingles |
 | `jingle.ogg` | Landing success jingle | Kenney "Music Jingles" pack (`jingles_STEEL00.ogg`) |
-| `missile.ogg` | Missile launch | Juhani Junkala, "The Essential Retro Video Game Sound Effects Collection" (OpenGameArt, CC0), `sfx_wpn_missilelaunch.wav`, converted to OGG |
+| `missile.ogg` | Missile launch | "Rocket Launch" by gracenew — Freesound sound 857959 (CC0), converted to OGG — https://freesound.org/people/gracenew/sounds/857959/ |
 
 CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/
