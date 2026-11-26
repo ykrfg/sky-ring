@@ -12,3 +12,5 @@ All sound effects in this folder are **CC0 1.0 (public domain)** — free for co
 | `missile.ogg` | Missile launch | "Rocket Launch" by gracenew — Freesound sound 857959 (CC0), converted to OGG — https://freesound.org/people/gracenew/sounds/857959/ |
 
 CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/
+| `bgm_title.ogg` | Title-screen BGM (loop-processed) | Music generated with Suno by the author |
+| `bgm_ingame.ogg` | In-flight BGM (loop-processed) | Music generated with Suno by the author |
