@@ -137,8 +137,15 @@ window.addEventListener('pointerdown', unlockAudio);
 
 // --- Boot -----------------------------------------------------------------------
 
-function touchCapable() {
-  return navigator.maxTouchPoints > 0 || 'ontouchstart' in window;
+// The touch flight controls are for players whose primary input is a
+// finger. A touchscreen laptop still reports touch *capability*
+// (maxTouchPoints > 0) while its primary pointer is the fine mouse, so
+// capability is the wrong test: ask the media query what the primary
+// pointer is. runGame() also reveals the buttons after the first real
+// touch, for tablets being driven with an attached mouse.
+function touchPrimary() {
+  return typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
 }
 
 async function boot() {
@@ -163,7 +170,7 @@ async function boot() {
   state.seed = seed;
   state.settings = settings;
   state.settingsSelected = 0;
-  state.touchUI = touchCapable();
+  state.touchUI = touchPrimary();
 
   const renderer = createRenderer(glCanvas, hudCanvas, world, { fixedSize: Boolean(sceneName) });
   renderer.setTerrain(terrainMesh);
@@ -208,6 +215,14 @@ function describeState(state) {
 function runGame(world, renderer) {
   const state = world.state;
   let accumulator = 0;
+
+  // If the primary pointer is fine (a mouse), the touch buttons start
+  // hidden — but a player who reaches out and touches the screen is
+  // telling us how they mean to play, so the first genuine touch brings
+  // the buttons up and keeps them.
+  window.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'touch') state.touchUI = true;
+  });
   let engineLive = false;
 
   // The title screen flies the parked TITLE_POSE; the live game and the

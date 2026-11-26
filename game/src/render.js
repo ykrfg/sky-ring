@@ -993,12 +993,17 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   function drawAirframe(model, pose, vp, camera, time, gear, override, scaleFactor = 1) {
     if (!model) return;
     const s = AIRCRAFT.scale * scaleFactor;
+    // Orientation signs: the model faces +Z and the physics nose for a
+    // positive (climbing) pitch is world.forward()'s +sin(pitch) rise. A
+    // positive right-handed rotation about +X swings +Z downward, so the
+    // pitch angle is negated here (and the bank likewise) to make the drawn
+    // airframe point where the simulation is actually flying it.
     const root = multiply(
       translation(pose.position[0], pose.position[1], pose.position[2]),
       multiply(
         rotationAbout([0, 1, 0], pose.heading + AIRCRAFT.yawOffset),
         multiply(
-          rotationAbout([1, 0, 0], pose.pitch),
+          rotationAbout([1, 0, 0], -pose.pitch),
           multiply(rotationAbout([0, 0, 1], -pose.bank), scaling(s, s, s)))));
     for (let i = 0; i < model.nodes.length; i++) {
       const node = model.nodes[i];
