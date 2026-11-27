@@ -1280,12 +1280,14 @@ export function createWorld(terrain, random) {
         }
       }
     }
-    // Over water the height grid reads as the sea floor (0), not the
+    // Over water the height grid reads as the sea itself (0), not the
     // surface, so the ditch test keys off the surface itself: without
     // this, an aircraft could level off a few metres under the visible
     // sea — below seaLevel yet above the old seaLevel-6 threshold — and
-    // fly on submerged. Over land the deep threshold still applies.
-    const overWater = terrain.heightAt(flight.position[0], flight.position[2]) < WORLD.seaLevel;
+    // fly on submerged. The grid's own convention is that 0 is the sea
+    // reading; low land (a coastal shelf on final approach) reads above
+    // it and must not trip the test, so the water test is exact.
+    const overWater = terrain.heightAt(flight.position[0], flight.position[2]) <= 0;
     if ((overWater && flight.position[1] < WORLD.seaLevel + CONTACT_CLEARANCE)
       || flight.position[1] < WORLD.seaLevel - 6) {
       crash('DITCHED', sound);
