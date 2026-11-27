@@ -1259,15 +1259,25 @@ export function createWorld(terrain, random) {
     updateFuel(dt);
 
     // Ground contact is tested at every altitude, not just near the strip:
-    // a hillside at clearance height is a crash like any other. The first
-    // two seconds after liftoff are exempt so the roll itself never trips it.
-    if (!flight.grounded && state.time - flight.liftoff > LANDING_GRACE) {
+    // a hillside at clearance height is a crash like any other. The judge
+    // is exempt for the first two seconds after liftoff so the roll itself
+    // never trips it — but the ground is not exempt: during the grace the
+    // airframe is still clamped to its parked clearance, so a botched
+    // rotation settles back onto the surface instead of sinking through
+    // it (it reached -37 m before this clamp existed).
+    if (!flight.grounded) {
       const height = groundAt(flight.position);
       const above = flight.position[1] - height;
       if (above <= CONTACT_CLEARANCE) {
-        flight.position[1] = Math.max(flight.position[1], height + CONTACT_CLEARANCE);
-        judgeContact(sound);
-        return;
+        const inGrace = state.time - flight.liftoff <= LANDING_GRACE;
+        flight.position[1] = Math.max(
+          flight.position[1],
+          height + (inGrace ? 0.35 : CONTACT_CLEARANCE),
+        );
+        if (!inGrace) {
+          judgeContact(sound);
+          return;
+        }
       }
     }
     // Over water the height grid reads as the sea floor (0), not the
