@@ -49,6 +49,7 @@ export const TOUCH_ZONES = [
   { name: 'throttleDown', code: 'KeyS', label: 'THR−', x: 1096, y: 486, r: 34 },
   { name: 'fire', code: 'KeyJ', label: 'FIRE', x: 1196, y: 486, r: 44 },
   { name: 'gear', code: 'KeyG', label: 'GEAR', x: 1196, y: 386, r: 28 },
+  { name: 'recover', code: 'KeyR', label: 'RCVR', x: 1196, y: 318, r: 28 },
 ];
 
 // ---------------------------------------------------------------------------
