@@ -10,7 +10,7 @@
 // world is painted twice, window.__shotReady is set, and the same frozen
 // frame is repainted for as long as the page stays open.
 
-import { AUDIO, BGM, RING_COUNT, STEP, SUN_DIR, TITLE_POSE, WORLD } from './config.js';
+import { AUDIO, BGM, CLOCK, MODE, RING_COUNT, STEP, SUN_DIR, TITLE_POSE, WORLD } from './config.js';
 import { buildTerrainAO, buildTerrainGrid, loadGLB, prepareTerrain } from './gltf.js';
 import { createInput } from './input.js';
 import { createRandom } from './random.js';
@@ -75,6 +75,32 @@ function playSound(name) {
     element.currentTime = 0;
     element.play().catch(() => {});
   } catch { /* autoplay policy — the next trigger retries */ }
+}
+
+// Enemy gunfire is registered here rather than in the config AUDIO map: it
+// is the one effect whose volume is set per trigger (by the shooter's range)
+// instead of by the SE slider alone. The world calls state.onEnemyGun when a
+// bandit opens fire; bursts that start within a few hundred milliseconds of
+// the last one heard are folded into it, so a whole wave shooting at once
+// still sounds like guns, not a pile-up of the same recording.
+const gunfireEl = new Audio('audio/gunfire.ogg');
+gunfireEl.preload = 'auto';
+gunfireEl.volume = 0;
+sfx.enemyGun = gunfireEl;
+let lastGunfireAt = -1;
+function playEnemyGun(state, enemy) {
+  const now = performance.now() / 1000;
+  if (now - lastGunfireAt < 0.3) return;
+  lastGunfireAt = now;
+  const f = state.flight.position;
+  const distance = Math.hypot(
+    enemy.position[0] - f[0], enemy.position[1] - f[1], enemy.position[2] - f[2]);
+  const gain = Math.max(0.12, Math.min(1, 1 - distance / 950));
+  try {
+    gunfireEl.volume = settings.se * gain;
+    gunfireEl.currentTime = 0;
+    gunfireEl.play().catch(() => {});
+  } catch { /* autoplay policy — the next burst retries */ }
 }
 
 // --- Music ----------------------------------------------------------------------
@@ -167,6 +193,7 @@ async function boot() {
 
   const world = createWorld(grid, createRandom(seed));
   const state = world.state;
+  state.onEnemyGun = (enemy) => playEnemyGun(state, enemy);
   state.seed = seed;
   state.settings = settings;
   state.settingsSelected = 0;
@@ -208,7 +235,8 @@ function stageShot(world, renderer) {
 function describeState(state) {
   const feet = Math.max(0, Math.round((state.flight.position[1] - WORLD.seaLevel) * 3.28));
   const knots = Math.round(state.flight.speed * 1.94);
-  return `${state.phase}. Altitude ${feet} feet. Speed ${knots} knots. `
+  return `${state.mode}. ${state.phase}. Altitude ${feet} feet. Speed ${knots} knots. `
+    + `Fuel ${Math.round(state.fuel)} percent. Hull ${Math.round(state.hull)} percent. `
     + `Rings ${state.ringIndex} of ${RING_COUNT}. Missiles ${state.missileCount}.`;
 }
 
@@ -228,14 +256,25 @@ function runGame(world, renderer) {
   // The title screen flies the parked TITLE_POSE; the live game and the
   // ?scene=title shot share it so the two can never drift apart.
   function parkOnTitle() {
-    Object.assign(state.flight, TITLE_POSE, { position: [...TITLE_POSE.position], liftoff: 0 });
+    Object.assign(state.flight, TITLE_POSE, {
+      position: [...TITLE_POSE.position], liftoff: 0,
+      engineOut: false, verticalSpeed: 0, evasion: 0,
+    });
     state.phase = 'title';
     state.time = 0;
+    // The menu backdrop sits at its own fixed hour, and no tower traffic,
+    // result card or damage cue from the last run follows the player back.
+    state.clock = CLOCK.title;
+    state.radio = null;
+    state.radioQueue = [];
+    state.result = null;
+    state.damageFlash = 0;
+    state.shake = 0;
     accumulator = 0;
   }
 
-  function beginRun() {
-    world.reset();
+  function beginRun(mode = MODE.SORTIE) {
+    world.reset(mode);
     accumulator = 0;
     engineLive = true;
     sfx.engine.volume = 0.12;
@@ -279,16 +318,19 @@ function runGame(world, renderer) {
       state.phase = 'title';
     } else if (state.phase === 'credits' && pressed.has('KeyC')) {
       state.phase = 'title';
+    } else if (state.phase === 'title'
+      && (pressed.has('KeyD') || pressed.has('PointerDogfight'))) {
+      beginRun(MODE.DOGFIGHT);
     } else if ((state.phase === 'title' || state.phase === 'credits')
       && (pressed.has('Enter') || pressed.has('Space') || pressed.has('PointerStart'))) {
-      beginRun();
+      beginRun(MODE.SORTIE);
     } else if ((state.phase === 'result' || state.phase === 'crashed')
       && pressed.has('PointerTitle')) {
       parkOnTitle();
     } else if ((state.phase === 'result' || state.phase === 'crashed')
       && (pressed.has('Enter') || pressed.has('Space')
         || pressed.has('PointerStart') || pressed.has('PointerRetry'))) {
-      beginRun();
+      beginRun(state.mode);
     }
 
     // The settings panel: up/down chooses a row, holding left/right slides it.
@@ -324,7 +366,7 @@ function runGame(world, renderer) {
     // The engine loop runs only while a sortie is live, pitched and gained
     // by the throttle; it is silenced on every other screen.
     const engine = sfx.engine;
-    if (engineLive && (state.phase === 'play' || state.phase === 'return')) {
+    if (engineLive && (state.phase === 'play' || state.phase === 'return') && !state.flight.engineOut) {
       if (engine.paused) engine.play().catch(() => {});
       const throttle = state.flight.throttle;
       engine.playbackRate = 0.72 + throttle * 0.78;

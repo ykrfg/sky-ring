@@ -10,6 +10,7 @@ All sound effects in this folder are **CC0 1.0 (public domain)** — free for co
 | `ring.ogg` | Target-ring pass chime | Kenney "Music Jingles" pack (`jingles_PIZZI00.ogg`) — https://kenney.nl/assets/music-jingles |
 | `jingle.ogg` | Landing success jingle | Kenney "Music Jingles" pack (`jingles_STEEL00.ogg`) |
 | `missile.ogg` | Missile launch | "Rocket Launch" by gracenew — Freesound sound 857959 (CC0), converted to OGG — https://freesound.org/people/gracenew/sounds/857959/ |
+| `gunfire.ogg` | Enemy cannon / machine-gun bursts | "Machine Gun Burst" by qubodup — Freesound sound 482121 (CC0), converted to OGG — https://freesound.org/people/qubodup/sounds/482121/ |
 | `bgm_title.ogg` | Title-screen BGM (loop-processed) | Music generated with Suno by the author |
 | `bgm_ingame.ogg` | In-flight BGM (loop-processed) | Music generated with Suno by the author |
 

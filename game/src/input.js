@@ -20,7 +20,7 @@ import { END_BUTTONS, TOUCH_ZONES } from './render.js';
 // these are preventDefault()ed so arrows and space cannot scroll the page.
 const GAME_KEYS = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
-  'KeyW', 'KeyS', 'KeyG', 'KeyJ', 'KeyF', 'KeyC', 'KeyO', 'KeyR',
+  'KeyW', 'KeyS', 'KeyG', 'KeyJ', 'KeyF', 'KeyC', 'KeyO', 'KeyR', 'KeyD',
   'Space', 'Enter', 'Escape',
 ]);
 
@@ -63,8 +63,9 @@ export function createInput(canvas) {
   // tap back into that space and queue the matching pseudo-key. The boxes are
   // [left, top, right, bottom] and must stay in step with the HUD layout.
   const HIT_BOXES = [
-    ['PointerStart', 398, 512, 632, 564],
-    ['PointerCredits', 648, 512, 882, 564],
+    ['PointerStart', 273, 512, 507, 564],
+    ['PointerDogfight', 523, 512, 757, 564],
+    ['PointerCredits', 773, 512, 1007, 564],
     ['PointerAudio', 548, 578, 732, 614],
   ];
   function toLogical(event) {

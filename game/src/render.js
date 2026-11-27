@@ -6,19 +6,27 @@
 //           fresnel environment sheen, procedural animated water, distance
 //           fog, and an ACES filmic curve before gamma. A radial speed-blur
 //           post pass runs over an off-screen copy of the frame.
-//   #hud  — a 2D canvas on top: flight readouts, the attitude indicator, the
-//           tactical radar, the cockpit panel with its gauges, and the
-//           title / credits / settings / result / crash screens.
+//           The sun, sky, fog and light all follow state.clock — a sortie
+//           that leaves in the afternoon lands at dusk, and a long fight
+//           runs into a starlit night with the runway lit. Aircraft cast
+//           real shadows from a small packed-depth shadow map that tracks
+//           the player, and a second additive pass carries the lamps:
+//           runway and approach lights, nav lights, the afterburner,
+//           wingtip vapour and the enemy's tracer fire.
+//   #hud  — a 2D canvas on top: flight readouts, the mission checklist,
+//           the tower radio line, the attitude indicator, the tactical
+//           radar, the cockpit panel with its gauges, and the title /
+//           credits / settings / result / crash screens.
 //
-// Determinism is a hard rule here: the only clock the renderer reads is
-// state.time, and the only randomness is a fixed-seed generator used once
-// while the scenery is built. A staged screenshot therefore comes out
-// identical on every load.
+// Determinism is a hard rule here: the only clocks the renderer reads are
+// state.time and state.clock, and the only randomness is a fixed-seed
+// generator used once while the scenery is built. A staged screenshot
+// therefore comes out identical on every load.
 
-import { AIRCRAFT, PALETTE, RENDER, RING_COUNT, SUN_DIR, VIEW, WORLD } from './config.js';
+import { AIRCRAFT, CLOCK, MODE, PALETTE, RENDER, RING_COUNT, VIEW, WORLD } from './config.js';
 import {
-  compose, cross, dot, identity, lookAt, multiply, normalize, perspective,
-  quatMatrix, scaling, sub, translation,
+  add, compose, cross, dot, identity, length, lookAt, multiply, normalize,
+  perspective, quatMatrix, scale, scaling, sub, transformPoint, translation,
 } from './math.js';
 
 // ---------------------------------------------------------------------------
@@ -98,6 +106,20 @@ uniform vec3 uTint;
 uniform vec3 uFogColor;
 uniform vec3 uSunDir;
 uniform vec3 uSunOnSky;
+uniform vec3 uSunColor;
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform vec3 uSkyLow;
+uniform vec3 uOrbColor;
+uniform float uOrbStrength;
+uniform float uStars;
+uniform float uNight;
+uniform float uCloudShadow;
+uniform mat4 uLightVP;
+uniform sampler2D uShadowMap;
+uniform float uShadowTexel;
+uniform int uShadowOn;
+uniform int uShadowRecv;
 uniform float uMetallic;
 uniform float uRoughness;
 uniform float uOpacity;
@@ -114,6 +136,7 @@ uniform int uHasNormal;
 uniform int uKindWater;
 uniform int uKindSky;
 uniform int uKindTerrain;
+uniform int uKindCloud;
 uniform int uBlended;
 
 const float PI = 3.14159265;
@@ -124,19 +147,68 @@ vec3 filmic(vec3 x) {
 }
 vec3 finish(vec3 linear) { return pow(filmic(linear), vec3(1.0 / 2.2)); }
 
-// The whole sky in one function: a height gradient, a warm band at the
-// horizon, the sun disc with its halo. The PBR core reuses it as the
-// environment map for the fresnel sheen, so reflections always agree with
-// the sky the player actually sees.
+// Value noise and its fbm stack: the terrain's field variation, the fine
+// detail that keeps the flats from looking stamped, and the moving cover
+// whose shadows cross the island all read from these.
+float hash21(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x),
+             mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { v += a * vnoise(p); p *= 2.03; a *= 0.5; }
+  return v;
+}
+float cloudCover(vec2 p, float t) {
+  float n = fbm(p * 0.00135 + vec2(t * 0.0045, t * 0.0021));
+  return smoothstep(0.52, 0.72, n);
+}
+
+// The shadow map stores depth packed into RGBA (plain WebGL1 has no float
+// depth texture to sample). Five taps around the texel soften the edge.
+float unpackDepth(vec4 c) {
+  return dot(c, vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0));
+}
+float shadowFactor(vec3 world) {
+  vec4 lp = uLightVP * vec4(world, 1.0);
+  vec3 sc = lp.xyz / max(0.0001, lp.w) * 0.5 + 0.5;
+  if (sc.x < 0.004 || sc.x > 0.996 || sc.y < 0.004 || sc.y > 0.996 || sc.z > 0.999) return 1.0;
+  float d = sc.z - 0.0016;
+  float sum = 0.0;
+  sum += step(d, unpackDepth(texture2D(uShadowMap, sc.xy)));
+  sum += step(d, unpackDepth(texture2D(uShadowMap, sc.xy + vec2(uShadowTexel, 0.0))));
+  sum += step(d, unpackDepth(texture2D(uShadowMap, sc.xy - vec2(uShadowTexel, 0.0))));
+  sum += step(d, unpackDepth(texture2D(uShadowMap, sc.xy + vec2(0.0, uShadowTexel))));
+  sum += step(d, unpackDepth(texture2D(uShadowMap, sc.xy - vec2(0.0, uShadowTexel))));
+  return sum / 5.0;
+}
+
+// The whole sky in one function: a height gradient between the three
+// clock-driven colours, the sun (or moon) disc with its halo, and — after
+// dark — a field of stars on a direction grid. The PBR core reuses it as
+// the environment map for the fresnel sheen, so reflections always agree
+// with the sky the player actually sees. The sky colours arrive in linear
+// space from the environment pass; only the fog colour is converted here.
 vec3 skyLight(vec3 dir) {
   float h = clamp(dir.y, -1.0, 1.0);
-  vec3 zenith = toLinear(vec3(0.045, 0.20, 0.44));
-  vec3 horizon = toLinear(vec3(0.62, 0.81, 0.90));
-  vec3 below = toLinear(vec3(0.55, 0.72, 0.78));
-  vec3 c = mix(horizon, zenith, pow(max(h, 0.0), 0.38));
-  c = mix(below, c, smoothstep(-0.12, 0.03, h));
+  vec3 c = mix(uSkyHorizon, uSkyZenith, pow(max(h, 0.0), 0.38));
+  c = mix(uSkyLow, c, smoothstep(-0.12, 0.03, h));
   float sunAmount = max(dot(dir, uSunOnSky), 0.0);
-  c += vec3(1.0, 0.82, 0.58) * (pow(sunAmount, 420.0) * 1.7 + pow(sunAmount, 18.0) * 0.11);
+  c += uOrbColor * (pow(sunAmount, 420.0) * 1.7 + pow(sunAmount, 18.0) * 0.12) * uOrbStrength;
+  c += uSkyHorizon * pow(1.0 - abs(h), 3.0) * 0.045;
+  if (uStars > 0.01 && dir.y > 0.015) {
+    vec2 g = vec2(atan(dir.z, dir.x), asin(clamp(dir.y, -1.0, 1.0))) * 64.0;
+    vec2 cell = floor(g), f = fract(g) - 0.5;
+    float sh = hash21(cell);
+    float star = step(0.968, sh) * smoothstep(0.20, 0.0, length(f));
+    star *= 0.62 + 0.38 * sin(uTime * 2.1 + sh * 61.7);
+    c += vec3(0.86, 0.92, 1.0) * star * uStars * 1.55;
+  }
   return c;
 }
 
@@ -184,29 +256,43 @@ void main() {
   if (uKindTerrain == 1) {
     // The island is coloured by rule, not by texture: grass on the flats,
     // rock where the slope steepens or the altitude grows, snow only on
-    // high, gentle ground. Two slow sine fields keep the bands from looking
-    // stamped on, and the source texture survives only as luminance detail
-    // (its baked snow tiles would otherwise punch white holes in the mesh).
+    // high, gentle ground. An fbm field varies the grass between meadow,
+    // scrub and dry pasture so the bands never look stamped on, a finer
+    // fbm breaks the surface up close, and the source texture survives
+    // only as luminance detail (its baked snow tiles would otherwise
+    // punch white holes in the mesh).
     float height = vWorld.y;
-    float field1 = sin(vWorld.x * 0.021 + sin(vWorld.z * 0.017) * 1.7) * 0.5 + 0.5;
-    float field2 = sin(vWorld.z * 0.033 + vWorld.x * 0.012) * 0.5 + 0.5;
+    float field = fbm(vWorld.xz * 0.0032 + 11.3);
+    float fine = fbm(vWorld.xz * 0.11) * 0.6 + fbm(vWorld.xz * 0.031) * 0.4;
     float slope = 1.0 - clamp(normal.y, 0.0, 1.0);
-    vec3 grass = mix(toLinear(vec3(0.10, 0.28, 0.16)), toLinear(vec3(0.29, 0.43, 0.22)), field1 * 0.7 + field2 * 0.3);
-    vec3 rock = mix(toLinear(vec3(0.24, 0.24, 0.22)), toLinear(vec3(0.43, 0.41, 0.36)), field2);
-    vec3 snow = toLinear(vec3(0.86, 0.90, 0.93));
-    float rockMix = smoothstep(0.20, 0.58, slope) + smoothstep(370.0, 540.0, height) * 0.24;
-    float snowMix = smoothstep(480.0, 640.0, height) * smoothstep(0.62, 0.30, slope);
+    vec3 grass = mix(toLinear(vec3(0.075, 0.20, 0.115)), toLinear(vec3(0.27, 0.40, 0.18)),
+      smoothstep(0.20, 0.74, field));
+    grass = mix(grass, toLinear(vec3(0.44, 0.41, 0.22)), smoothstep(0.60, 0.86, field) * 0.7);
+    vec3 rock = mix(toLinear(vec3(0.22, 0.21, 0.19)), toLinear(vec3(0.42, 0.40, 0.35)), fine);
+    vec3 snow = toLinear(vec3(0.84, 0.88, 0.92));
+    float rockMix = smoothstep(0.20, 0.56, slope) + smoothstep(390.0, 560.0, height) * 0.30;
+    float snowMix = smoothstep(500.0, 660.0, height) * smoothstep(0.66, 0.30, slope);
     albedo = mix(grass, rock, clamp(rockMix, 0.0, 1.0));
     albedo = mix(albedo, snow, clamp(snowMix, 0.0, 1.0));
+    albedo *= 0.84 + fine * 0.30;
     if (uHasBase == 1) {
       float detail = dot(texture2D(uBaseMap, vUV).rgb, vec3(0.30, 0.55, 0.15));
-      albedo *= 0.88 + detail * 0.24;
+      albedo *= 0.90 + detail * 0.20;
     }
+  }
+
+  // Occlusion from the airframe shadow map, and — on the terrain only —
+  // from the drifting cloud cover. Both only ever take light away.
+  float shadow = 1.0;
+  if (uShadowOn == 1 && uShadowRecv == 1) shadow = shadowFactor(vWorld);
+  float cloudShade = 1.0;
+  if (uKindTerrain == 1 && uCloudShadow > 0.001) {
+    cloudShade = 1.0 - cloudCover(vWorld.xz, uTime) * uCloudShadow * 0.62;
   }
 
   vec3 sunDir = normalize(uSunDir);
   vec3 halfDir = normalize(viewDir + sunDir);
-  float noL = max(dot(normal, sunDir), 0.0);
+  float noL = max(dot(normal, sunDir), 0.0) * shadow * cloudShade;
   float noV = max(dot(normal, viewDir), 0.001);
   float noH = max(dot(normal, halfDir), 0.0);
   float voH = max(dot(viewDir, halfDir), 0.0);
@@ -216,19 +302,27 @@ void main() {
   vec3 specular = ggx(noH, alpha) * smith(noV, noL, alpha) * fresnel
     / max(0.001, 4.0 * noV * noL + 0.0001);
 
-  // Hemisphere ambient: sky colour from above, sea-dark bounce from below.
-  vec3 hemi = mix(toLinear(vec3(0.12, 0.18, 0.25)), toLinear(vec3(0.58, 0.72, 0.80)),
-    clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
-  vec3 sunColour = vec3(1.0, 0.88, 0.72) * 2.35;
+  // Hemisphere ambient: sky colour from above, sea-dark bounce from below,
+  // both sinking toward their night values as the clock runs down.
+  vec3 hemiLow = mix(toLinear(vec3(0.12, 0.18, 0.25)), toLinear(vec3(0.016, 0.023, 0.044)), uNight);
+  vec3 hemiHigh = mix(toLinear(vec3(0.58, 0.72, 0.80)), toLinear(vec3(0.075, 0.100, 0.155)), uNight);
+  vec3 hemi = mix(hemiLow, hemiHigh, clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
+  vec3 sunColour = uSunColor;
   float hemiWeight = uKindTerrain == 1 ? 1.65 : 0.75;
+  // The sky term is only partly blocked by a cast shadow, but a little
+  // occlusion keeps the shadow readable against the strong daylight ambient.
+  float sunBlock = mix(0.80, 1.0, shadow);
 
-  vec3 colour = albedo * (1.0 - metallic) * (hemi * hemiWeight + sunColour * noL / PI) * ao;
-  colour += specular * sunColour * mix(0.55, 1.0, ao);
-  colour += fresnel * hemi * 0.22 * ao;
+  vec3 colour = albedo * (1.0 - metallic) * (hemi * hemiWeight * sunBlock + sunColour * noL / PI) * ao;
+  colour += specular * sunColour * mix(0.55, 1.0, ao) * shadow * cloudShade;
+  colour += fresnel * hemi * 0.22 * ao * sunBlock;
   colour += albedo * metallic * hemi * 0.16 * ao;
+  // Moonlight: a fixed cool wash that only exists once the sun is gone.
+  vec3 moonDir = normalize(vec3(-0.45, 0.62, 0.64));
+  colour += albedo * uNight * max(dot(normal, moonDir), 0.0) * vec3(0.115, 0.155, 0.290);
   colour += albedo * uEmissive * 1.8;
-  colour += albedo * 0.08;
-  if (uKindTerrain == 1) colour += albedo * 0.15;
+  colour += albedo * mix(0.08, 0.012, uNight);
+  if (uKindTerrain == 1) colour += albedo * mix(0.15, 0.02, uNight);
 
   // Fresnel environment sheen: reflect the view ray into the same sky the
   // dome draws and weight it by Fresnel and surface smoothness, so polished
@@ -239,8 +333,9 @@ void main() {
 
   // A cool fill from low over the sea keeps shadow sides readable.
   vec3 fillDir = normalize(vec3(0.55, 0.35, 0.75));
-  colour += albedo * max(dot(normal, fillDir), 0.0) * vec3(0.26, 0.36, 0.46) * 1.25 * ao;
-  colour += vec3(0.35, 0.58, 0.75) * pow(1.0 - noV, 3.0) * 0.30;
+  colour += albedo * max(dot(normal, fillDir), 0.0)
+    * mix(vec3(0.26, 0.36, 0.46), vec3(0.015, 0.025, 0.05), uNight) * 1.25 * ao;
+  colour += mix(vec3(0.35, 0.58, 0.75), vec3(0.05, 0.09, 0.15), uNight) * pow(1.0 - noV, 3.0) * 0.30;
 
   if (uKindWater == 1) {
     // Animated water: three travelling sine waves perturb the normal (the
@@ -258,25 +353,39 @@ void main() {
       w1 * 0.0008 + w2 * 0.0005, 0.0, w2 * 0.0007 + w3 * 0.0003) * detail);
     vec3 reflected = reflect(-viewDir, wNormal);
     float waterFresnel = 0.025 + 0.975 * pow(1.0 - max(dot(wNormal, viewDir), 0.0), 5.0);
-    vec3 deep = toLinear(vec3(0.018, 0.10, 0.145));
-    colour = mix(deep, skyLight(reflected), clamp(0.10 + waterFresnel * 0.52, 0.0, 0.86));
-    // The glint sparkles with the fastest wave up close and settles to a
-    // steady sheen far away, where the normal detail has faded out anyway.
+    vec3 deep = toLinear(mix(vec3(0.018, 0.10, 0.145), vec3(0.004, 0.012, 0.022), uNight));
+    colour = mix(deep, skyLight(reflected), clamp(0.10 + waterFresnel * 0.62, 0.0, 0.90));
+    // The glitter path: a tight reflection of the orb — sun by day, moon
+    // after dark — that sparkles with the fastest wave up close and
+    // settles to a steady sheen far away, where the normal detail has
+    // faded out anyway.
     float sparkle = 1.6 + 0.9 * (w3 * 0.5 + 0.5) * detail;
-    colour += vec3(1.0, 0.83, 0.60) * pow(max(dot(reflected, sunDir), 0.0), 260.0) * sparkle;
-    colour += vec3(0.004, 0.012, 0.016) * ((w1 * 0.55 + w2 * 0.45) * 0.5 + 0.5);
+    float glint = pow(max(dot(reflected, sunDir), 0.0), 320.0) * (1.0 - uNight * 0.85);
+    float moonGlint = pow(max(dot(reflected, moonDir), 0.0), 480.0) * uNight * 0.55;
+    colour += uOrbColor * uOrbStrength * (glint * 2.2 * sparkle + moonGlint);
+    float starSparkle = step(0.992, hash21(floor(q * 0.9) + floor(uTime * 7.0)));
+    colour += vec3(0.45, 0.68, 1.0) * starSparkle * uNight * 0.05;
+    colour += vec3(0.004, 0.012, 0.016) * ((w1 * 0.55 + w2 * 0.45) * 0.5 + 0.5) * (1.0 - uNight * 0.7);
   }
 
   float dist = length(uCamera - vWorld);
   float fogged = smoothstep(uFogNear, uFogFar, dist);
   colour = mix(colour, toLinear(uFogColor), fogged * 0.92);
   float outAlpha = uBlended == 1 ? sampled.a * uOpacity : 1.0;
+  if (uKindCloud == 1) {
+    // Cloud hulls fade at the silhouette and billow with the same fbm the
+    // terrain uses, so a low-poly sphere reads as a soft lit volume.
+    float facing = clamp(dot(normal, viewDir), 0.0, 1.0);
+    float billow = fbm(vWorld.xz * 0.021 + vec2(vWorld.y * 0.052, -vWorld.y * 0.041));
+    outAlpha *= smoothstep(0.0, 0.46, facing) * (0.58 + 0.42 * smoothstep(0.30, 0.72, billow));
+  }
   gl_FragColor = vec4(finish(colour * 1.05), outAlpha);
 }`;
 
 // Radial speed blur: the frame is re-sampled a few times along the ray from
 // the screen centre, weighted toward the sharp centre sample. Strength 0 is
-// an exact pass-through.
+// an exact pass-through for the blur itself; the vignette and the whisper
+// of film grain that finish the frame always run.
 const POST_VERT = `
 attribute vec2 aPos;
 varying vec2 vUV;
@@ -291,22 +400,50 @@ varying vec2 vUV;
 uniform sampler2D uScene;
 uniform float uStrength;
 uniform vec2 uCentre;
+uniform float uVignette;
+uniform float uGrain;
+uniform float uTime;
+uniform vec2 uResolution;
 void main() {
+  vec4 color;
   if (uStrength < 0.0001) {
-    gl_FragColor = texture2D(uScene, vUV);
-    return;
+    color = texture2D(uScene, vUV);
+  } else {
+    vec2 dir = vUV - uCentre;
+    float mask = smoothstep(0.035, 0.55, length(dir));
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float t = float(i) / 3.0;
+      float w = 1.0 - t * 0.55;
+      sum += texture2D(uScene, vUV - dir * uStrength * mask * t) * w;
+      total += w;
+    }
+    color = sum / total;
   }
-  vec2 dir = vUV - uCentre;
-  float mask = smoothstep(0.035, 0.55, length(dir));
-  vec4 sum = vec4(0.0);
-  float total = 0.0;
-  for (int i = 0; i < 4; i++) {
-    float t = float(i) / 3.0;
-    float w = 1.0 - t * 0.55;
-    sum += texture2D(uScene, vUV - dir * uStrength * mask * t) * w;
-    total += w;
-  }
-  gl_FragColor = sum / total;
+  vec2 centred = (vUV - 0.5) * vec2(1.04, 1.0);
+  float edge = smoothstep(0.32, 0.92, length(centred));
+  color.rgb *= 1.0 - edge * uVignette;
+  float grain = fract(sin(dot(vUV * uResolution + uTime * 57.0, vec2(12.9898, 78.233))) * 43758.5453);
+  color.rgb += (grain - 0.5) * uGrain;
+  gl_FragColor = color;
+}`;
+
+// The shadow pass: depth only, packed into RGBA by the same encoding the
+// scene shader unpacks. One caster program for every airframe.
+const SHADOW_VERT = `
+attribute vec3 aPosition;
+uniform mat4 uLightVP;
+uniform mat4 uModel;
+void main() { gl_Position = uLightVP * uModel * vec4(aPosition, 1.0); }`;
+
+const SHADOW_FRAG = `
+precision highp float;
+void main() {
+  float depth = gl_FragCoord.z;
+  vec4 enc = fract(depth * vec4(1.0, 255.0, 65025.0, 16581375.0));
+  enc -= enc.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);
+  gl_FragColor = enc;
 }`;
 
 // ---------------------------------------------------------------------------
@@ -502,9 +639,12 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   gl.useProgram(program);
   const UNIFORM_NAMES = [
     'uMVP', 'uModel', 'uCamera', 'uTint', 'uFogColor', 'uSunDir', 'uSunOnSky',
+    'uSunColor', 'uSkyZenith', 'uSkyHorizon', 'uSkyLow', 'uOrbColor', 'uOrbStrength',
+    'uStars', 'uNight', 'uCloudShadow', 'uLightVP', 'uShadowMap', 'uShadowTexel',
+    'uShadowOn', 'uShadowRecv',
     'uMetallic', 'uRoughness', 'uOpacity', 'uEmissive', 'uTime', 'uFogNear', 'uFogFar',
     'uBaseMap', 'uOrmMap', 'uNormalMap', 'uHasBase', 'uHasOrm', 'uHasNormal',
-    'uKindWater', 'uKindSky', 'uKindTerrain', 'uBlended',
+    'uKindWater', 'uKindSky', 'uKindTerrain', 'uKindCloud', 'uBlended',
   ];
   const uni = {};
   for (const name of UNIFORM_NAMES) uni[name] = gl.getUniformLocation(program, name);
@@ -516,11 +656,81 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   };
   gl.getExtension('OES_element_index_uint');
 
-  // The sun the shader lights with, and the (different) direction the sky
-  // gradient paints the disc at — the disc sits low over the sea in the
-  // title framing while the light itself comes from higher.
-  const sunDir = SUN_DIR;
-  const sunOnSky = [-0.55, 0.09, 0.82];
+  // --- the environment -------------------------------------------------------
+  // Everything the light does is derived from state.clock once per frame
+  // into this block: the sun's path (an arc through the afternoon, a long
+  // descent to dusk, then the moon's watch), the three sky colours, the fog,
+  // and the shadow pass's outputs. drawMesh reads it for every uniform it
+  // sets, so the whole frame agrees about what time it is.
+
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const sstep = (a, b, v) => {
+    const t = clamp01((v - a) / (b - a));
+    return t * t * (3 - 2 * t);
+  };
+  const mixN = (a, b, t) => a + (b - a) * t;
+  const lin3 = (c) => c.map((v) => Math.pow(Math.max(0, v), 2.2));
+  const mix3 = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+  const scaled3 = (c, s) => c.map((v) => v * s);
+
+  function computeEnvironment(state) {
+    const clock = state.clock !== undefined && state.clock !== null ? state.clock : CLOCK.start;
+    let elevation;
+    if (clock >= 8 && clock <= 16) elevation = 0.20 + 0.80 * Math.sin((clock - 8) / 8 * Math.PI);
+    else if (clock > 16 && clock <= 21) elevation = mixN(0.20, -0.22, sstep(0, 1, (clock - 16) / 5));
+    else if (clock > 21 || clock < 6) elevation = -0.38;
+    else elevation = mixN(-0.22, 0.20, (clock - 6) / 2);
+
+    const azimuth = (clamp01((clock - 6) / 12) * 2 - 1) * 1.05;
+    const orbVisual = normalize([Math.sin(azimuth), elevation, -0.52 - 0.22 * Math.cos(azimuth)]);
+    // The light never quite reaches the horizon: a sun below the sea would
+    // light the world from underneath, so the lighting direction floors
+    // its elevation and lets the colour do the sunset instead.
+    const lightDir = normalize([Math.sin(azimuth) * 0.55, Math.max(0.10, elevation), -0.60]);
+
+    const night = 1 - sstep(-0.20, 0.02, elevation);
+    const day = sstep(0.0, 0.24, elevation);
+    const sunset = clamp01(1 - Math.abs(elevation - 0.02) / 0.30) * (1 - night * 0.35);
+
+    const daySky = { zenith: lin3([0.045, 0.20, 0.44]), horizon: lin3([0.62, 0.81, 0.90]), low: lin3([0.55, 0.72, 0.78]) };
+    const duskSky = { zenith: lin3([0.075, 0.11, 0.28]), horizon: lin3([0.95, 0.45, 0.22]), low: lin3([0.28, 0.23, 0.30]) };
+    const nightSky = { zenith: lin3([0.006, 0.011, 0.030]), horizon: lin3([0.030, 0.048, 0.095]), low: lin3([0.010, 0.016, 0.030]) };
+    const blendSky = (key) => mix3(mix3(nightSky[key], daySky[key], day), duskSky[key], sunset * 0.9);
+
+    const daySun = scaled3(lin3([1.0, 0.90, 0.74]), 2.35);
+    const duskSun = scaled3(lin3([1.0, 0.48, 0.22]), 1.65);
+    const sunColor = mix3(mix3([0.030, 0.048, 0.10], daySun, day), duskSun, sunset * 0.85);
+
+    const fog = mix3(mix3([0.022, 0.033, 0.058], [...PALETTE.fog], day), [0.70, 0.47, 0.40], sunset * 0.7);
+
+    const moon = normalize([-Math.sin(azimuth) * 0.6, Math.max(0.22, -elevation * 0.9), 0.55]);
+    const sunUp = elevation > -0.02;
+
+    return {
+      clock,
+      sunDir: lightDir,
+      sunVisual: sunUp ? orbVisual : moon,
+      sunColor,
+      skyZenith: blendSky('zenith'),
+      skyHorizon: blendSky('horizon'),
+      skyLow: blendSky('low'),
+      orbColor: sunUp
+        ? mix3(lin3([1.0, 0.85, 0.58]), lin3([1.0, 0.45, 0.18]), sunset)
+        : lin3([0.72, 0.82, 1.0]),
+      orbStrength: sunUp ? mixN(1.0, 0.72, sunset) : 0.55,
+      stars: night * 1.15 + sunset * 0.05,
+      night,
+      day,
+      cloudShadow: mixN(0.15, 0.55, day) * (1 - night * 0.6),
+      fog,
+      fogNear: mixN(260, 350, day),
+      fogFar: mixN(2500, 3900, day),
+      lightVP: null,
+      shadowOn: false,
+      shadowTexel: 1 / 1024,
+    };
+  }
+  let env = null;
 
   // --- post pass state -----------------------------------------------------
 
@@ -529,6 +739,10 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     scene: gl.getUniformLocation(postProgram, 'uScene'),
     strength: gl.getUniformLocation(postProgram, 'uStrength'),
     centre: gl.getUniformLocation(postProgram, 'uCentre'),
+    vignette: gl.getUniformLocation(postProgram, 'uVignette'),
+    grain: gl.getUniformLocation(postProgram, 'uGrain'),
+    time: gl.getUniformLocation(postProgram, 'uTime'),
+    resolution: gl.getUniformLocation(postProgram, 'uResolution'),
   };
   const postAtt = gl.getAttribLocation(postProgram, 'aPos');
   const postQuadBuffer = gl.createBuffer();
@@ -562,7 +776,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     if (complete) sceneTarget = { fbo, colour, depth };
   }
 
-  function presentScene(strength) {
+  function presentScene(strength, time = 0, vignette = 0.42) {
     if (!sceneTarget) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, glCanvas.width, glCanvas.height);
@@ -576,11 +790,68 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     gl.uniform1i(postUni.scene, 0);
     gl.uniform1f(postUni.strength, strength);
     gl.uniform2f(postUni.centre, 0.5, 0.52);
+    gl.uniform1f(postUni.vignette, Math.min(0.85, vignette));
+    gl.uniform1f(postUni.grain, 0.022);
+    gl.uniform1f(postUni.time, time);
+    gl.uniform2f(postUni.resolution, glCanvas.width, glCanvas.height);
     gl.bindBuffer(gl.ARRAY_BUFFER, postQuadBuffer);
     gl.enableVertexAttribArray(postAtt);
     gl.vertexAttribPointer(postAtt, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.useProgram(program);
+  }
+
+  // --- shadow map state ------------------------------------------------------
+  // A single RGBA target the size of the quality step, re-rendered each
+  // frame with only the airframes in it. There is no QUALITY setting in
+  // this build's settings panel, so the resolution follows the backbuffer:
+  // full-size stages get the 1024 map, smaller ones the 512.
+
+  const shadowProgram = linkProgram(gl, SHADOW_VERT, SHADOW_FRAG);
+  const shadowUni = {
+    lightVP: gl.getUniformLocation(shadowProgram, 'uLightVP'),
+    model: gl.getUniformLocation(shadowProgram, 'uModel'),
+  };
+  const shadowAtt = gl.getAttribLocation(shadowProgram, 'aPosition');
+  let shadowTarget = null;
+
+  function makeShadowTarget(size) {
+    if (shadowTarget) {
+      gl.deleteFramebuffer(shadowTarget.fbo);
+      gl.deleteTexture(shadowTarget.colour);
+      gl.deleteRenderbuffer(shadowTarget.depth);
+      shadowTarget = null;
+    }
+    const colour = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, colour);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colour, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (complete) shadowTarget = { fbo, colour, depth, size };
+  }
+
+  // An orthographic frustum for the light: math.js ships perspective only.
+  function ortho(left, right, bottom, top, near, far) {
+    const m = new Float32Array(16);
+    m[0] = 2 / (right - left);
+    m[5] = 2 / (top - bottom);
+    m[10] = -2 / (far - near);
+    m[12] = -(right + left) / (right - left);
+    m[13] = -(top + bottom) / (top - bottom);
+    m[14] = -(far + near) / (far - near);
+    m[15] = 1;
+    return m;
   }
 
   // --- texture and buffer caches -------------------------------------------
@@ -641,7 +912,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   // --- the one draw routine --------------------------------------------------
   // material: { color, metallic, roughness, base, orm, normal, opacity,
   //             emissive } — every field optional.
-  // flags:    { water, sky, terrain, blended, doubleSided }
+  // flags:    { water, sky, terrain, cloud, shadow, blended, doubleSided }
 
   function drawMesh(geo, material, model, vp, camera, time, flags = {}) {
     if (!geo) return;
@@ -656,17 +927,34 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     gl.uniform1f(uni.uOpacity, m.opacity !== undefined && m.opacity !== null ? m.opacity : 1);
     gl.uniform1f(uni.uEmissive, m.emissive || 0);
     gl.uniform1f(uni.uTime, time);
-    gl.uniform3fv(uni.uFogColor, PALETTE.fog);
-    gl.uniform1f(uni.uFogNear, 350);
-    gl.uniform1f(uni.uFogFar, 3900);
-    gl.uniform3fv(uni.uSunDir, sunDir);
-    gl.uniform3fv(uni.uSunOnSky, sunOnSky);
+    gl.uniform3fv(uni.uFogColor, env.fog);
+    gl.uniform1f(uni.uFogNear, env.fogNear);
+    gl.uniform1f(uni.uFogFar, env.fogFar);
+    gl.uniform3fv(uni.uSunDir, env.sunDir);
+    gl.uniform3fv(uni.uSunOnSky, env.sunVisual);
+    gl.uniform3fv(uni.uSunColor, env.sunColor);
+    gl.uniform3fv(uni.uSkyZenith, env.skyZenith);
+    gl.uniform3fv(uni.uSkyHorizon, env.skyHorizon);
+    gl.uniform3fv(uni.uSkyLow, env.skyLow);
+    gl.uniform3fv(uni.uOrbColor, env.orbColor);
+    gl.uniform1f(uni.uOrbStrength, env.orbStrength);
+    gl.uniform1f(uni.uStars, env.stars);
+    gl.uniform1f(uni.uNight, env.night);
+    gl.uniform1f(uni.uCloudShadow, env.cloudShadow);
+    gl.uniformMatrix4fv(uni.uLightVP, false, env.lightVP || identity());
+    gl.uniform1f(uni.uShadowTexel, env.shadowTexel);
+    gl.uniform1i(uni.uShadowOn, env.shadowOn ? 1 : 0);
+    gl.uniform1i(uni.uShadowRecv, flags.shadow ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, shadowTarget ? shadowTarget.colour : null);
+    gl.uniform1i(uni.uShadowMap, 3);
     gl.uniform1i(uni.uHasBase, m.base ? 1 : 0);
     gl.uniform1i(uni.uHasOrm, m.orm ? 1 : 0);
     gl.uniform1i(uni.uHasNormal, m.normal ? 1 : 0);
     gl.uniform1i(uni.uKindWater, flags.water ? 1 : 0);
     gl.uniform1i(uni.uKindSky, flags.sky ? 1 : 0);
     gl.uniform1i(uni.uKindTerrain, flags.terrain ? 1 : 0);
+    gl.uniform1i(uni.uKindCloud, flags.cloud ? 1 : 0);
     gl.uniform1i(uni.uBlended, flags.blended ? 1 : 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, textureFor(m.base));
@@ -745,6 +1033,45 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       for (const side of [-1, 1]) pushBox(b, side * 54, y, z, 1.0, 1.6, 1.0);
     }
     return finalize(b);
+  })();
+
+  // The lamp glow sprites that come out after dark, in runway-local
+  // coordinates like the meshes above: edge lights (kind 0/1 by side),
+  // threshold bars (kind 2), and the approach line running out past the
+  // near threshold, whose lamps chase in sequence. The additive pass in
+  // render() places them; by day their strength is near zero.
+  const runwayGlowSpots = [];
+  const approachGlowSpots = [];
+  {
+    const y = WORLD.runwayHeight + 0.5;
+    for (let z = -300; z <= 300; z += 50) {
+      for (const side of [-1, 1]) runwayGlowSpots.push([side * 54, y + 0.8, z, side > 0 ? 1 : 0]);
+    }
+    for (const end of [-1, 1]) {
+      for (let x = -30; x <= 30; x += 10) runwayGlowSpots.push([x, y + 0.8, end * 310, 2]);
+    }
+    for (let z = -355; z >= -610; z -= 45) {
+      approachGlowSpots.push([0, y + 0.8, z]);
+      if (z <= -470) {
+        approachGlowSpots.push([-30, y + 0.8, z]);
+        approachGlowSpots.push([30, y + 0.8, z]);
+      }
+    }
+  }
+
+  // A soft white disc for every lamp sprite: the colour comes from the
+  // material tint, the falloff from this radial gradient.
+  const glowTexture = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(64, 64, 2, 64, 64, 62);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.42)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    return c;
   })();
 
   // Trees: scattered by a private fixed-seed generator over the island's
@@ -990,21 +1317,27 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   const ENEMY_PAINT = { color: [0.63, 0.17, 0.13], metallic: 0.45, roughness: 0.52 };
   const WRECK_PAINT = { color: [0.18, 0.17, 0.16], metallic: 0.5, roughness: 0.75 };
 
-  function drawAirframe(model, pose, vp, camera, time, gear, override, scaleFactor = 1) {
-    if (!model) return;
+  // The airframe's world matrix for a pose, shared by the lit draw, the
+  // shadow pass and the lamp placement so all three always agree.
+  // Orientation signs: the model faces +Z and the physics nose for a
+  // positive (climbing) pitch is world.forward()'s +sin(pitch) rise. A
+  // positive right-handed rotation about +X swings +Z downward, so the
+  // pitch angle is negated here (and the bank likewise) to make the drawn
+  // airframe point where the simulation is actually flying it.
+  function airframeRoot(pose, scaleFactor = 1) {
     const s = AIRCRAFT.scale * scaleFactor;
-    // Orientation signs: the model faces +Z and the physics nose for a
-    // positive (climbing) pitch is world.forward()'s +sin(pitch) rise. A
-    // positive right-handed rotation about +X swings +Z downward, so the
-    // pitch angle is negated here (and the bank likewise) to make the drawn
-    // airframe point where the simulation is actually flying it.
-    const root = multiply(
+    return multiply(
       translation(pose.position[0], pose.position[1], pose.position[2]),
       multiply(
         rotationAbout([0, 1, 0], pose.heading + AIRCRAFT.yawOffset),
         multiply(
           rotationAbout([1, 0, 0], -pose.pitch),
           multiply(rotationAbout([0, 0, 1], -pose.bank), scaling(s, s, s)))));
+  }
+
+  function drawAirframe(model, pose, vp, camera, time, gear, override, scaleFactor = 1) {
+    if (!model) return;
+    const root = airframeRoot(pose, scaleFactor);
     for (let i = 0; i < model.nodes.length; i++) {
       const node = model.nodes[i];
       if (node.mesh < 0) continue;
@@ -1038,6 +1371,126 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     drawAirframe(aircraftModel,
       { position: wreck.position, heading: wreck.spin, pitch: wreck.spin * 0.7, bank: wreck.spin * 1.3 },
       vp, camera, time, 0, WRECK_PAINT, 0.9);
+  }
+
+  // --- the shadow pass ---------------------------------------------------------
+  // The same node walk as drawAirframe, but only positions go in: the
+  // packed-depth program needs nothing else. Gear nodes follow the same
+  // rules (animated for the player, skipped for tinted airframes).
+
+  function drawAirframeShadow(pose, gear, override, scaleFactor = 1) {
+    if (!aircraftModel) return;
+    const root = airframeRoot(pose, scaleFactor);
+    for (let i = 0; i < aircraftModel.nodes.length; i++) {
+      const node = aircraftModel.nodes[i];
+      if (node.mesh < 0) continue;
+      const isGear = node.name.startsWith('Gear_');
+      if (override && isGear) continue;
+      let local = node.local;
+      if (!override && isGear) {
+        const q = gearQuaternion(aircraftModel, i, gear);
+        if (q) local = compose(node.translation, q, node.scale);
+      }
+      gl.uniformMatrix4fv(shadowUni.model, false, multiply(root, local));
+      for (const prim of aircraftModel.meshes[node.mesh]) {
+        const b = buffersFor(prim);
+        gl.bindBuffer(gl.ARRAY_BUFFER, b.position);
+        gl.enableVertexAttribArray(shadowAtt);
+        gl.vertexAttribPointer(shadowAtt, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b.index);
+        gl.drawElements(b.mode, b.count, b.indexType, 0);
+      }
+    }
+  }
+
+  // Rebuild the shadow map for this frame: an ortho box around the player,
+  // sized by altitude, lit from the environment's sun direction. Skipped
+  // on the menu screens and when the player is too high for a shadow to
+  // read; env.shadowOn stays false then and the shader never samples it.
+  function renderShadowPass(state) {
+    if (!env || !aircraftModel) return;
+    if (state.phase === 'title' || state.phase === 'credits' || state.phase === 'settings') return;
+    const f = state.flight;
+    const ground = Math.max(world.groundAt(f.position), WORLD.seaLevel);
+    const altitude = f.position[1] - ground;
+    if (altitude > 330) return;
+    const size = glCanvas.width >= 1280 ? 1024 : 512;
+    if (!shadowTarget || shadowTarget.size !== size) makeShadowTarget(size);
+    if (!shadowTarget) return;
+    const extent = 95 + Math.min(altitude, 300) * 1.05;
+    const centre = [f.position[0], ground + 2, f.position[2]];
+    const eye = add(centre, scale(env.sunDir, 360));
+    const lightVP = multiply(
+      ortho(-extent, extent, -extent, extent, 10, 820),
+      lookAt(eye, centre, [0, 1, 0]));
+    env.lightVP = lightVP;
+    env.shadowTexel = 1.7 / size;
+    env.shadowOn = true;
+
+    gl.useProgram(shadowProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTarget.fbo);
+    gl.viewport(0, 0, size, size);
+    gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.depthMask(true);
+    gl.disable(gl.CULL_FACE);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniformMatrix4fv(shadowUni.lightVP, false, lightVP);
+    gl.disableVertexAttribArray(att.normal);
+    gl.disableVertexAttribArray(att.uv);
+    gl.disableVertexAttribArray(att.ao);
+
+    if (state.phase !== 'crashed') drawAirframeShadow(f, f.gear, null);
+    for (const enemy of state.enemies) {
+      if (!enemy.alive || state.phase === 'title') continue;
+      const dx = f.position[0] - enemy.position[0];
+      const dz = f.position[2] - enemy.position[2];
+      drawAirframeShadow(
+        { position: enemy.position, heading: Math.atan2(dx, dz), pitch: 0, bank: enemy.bank },
+        0, ENEMY_PAINT, 1.0);
+    }
+    for (const wreck of state.wrecks) {
+      drawAirframeShadow(
+        { position: wreck.position, heading: wreck.spin, pitch: wreck.spin * 0.7, bank: wreck.spin * 1.3 },
+        0, WRECK_PAINT, 0.9);
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    gl.useProgram(program);
+  }
+
+  // Airframe-local offsets (right, up, forward) in world space, for placing
+  // the nav lights, the burner glow and the wingtip vapour without walking
+  // the GLB hierarchy. Bank and heading only — at lamp scale the pitch
+  // offset is invisible.
+  function aircraftPoint(flight, local) {
+    const cb = Math.cos(flight.bank), sb = Math.sin(flight.bank);
+    const rx = local[0] * cb + local[1] * sb;
+    const ry = -local[0] * sb + local[1] * cb;
+    const cy = Math.cos(flight.heading), sy = Math.sin(flight.heading);
+    return [
+      flight.position[0] + rx * cy + local[2] * sy,
+      flight.position[1] + ry,
+      flight.position[2] - rx * sy + local[2] * cy,
+    ];
+  }
+
+  // One additive lamp sprite. Sprites almost on top of the chase camera
+  // fade out so a wingtip lamp cannot fill the screen in a hard turn, and
+  // the emissive term keeps the sprite self-lit after dark — without it an
+  // additive quad would multiply against a black sky and vanish.
+  function glowSprite(position, size, color, opacity, camera, vp, time, emissive = 1.0) {
+    const d = length(sub(position, camera));
+    const near = sstep(6, 30, d);
+    const a = Math.min(1, opacity) * near;
+    if (a <= 0.012) return;
+    drawMesh(puffQuad,
+      { base: glowTexture, color, opacity: a, metallic: 0, roughness: 1, emissive },
+      billboardMatrix(position, size, camera), vp, camera, time,
+      { blended: true, doubleSided: true });
   }
 
   // --- billboards --------------------------------------------------------------
@@ -1291,9 +1744,21 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     hud.stroke();
 
     const returning = state.phase === 'return';
-    const target = returning
+    let target = returning
       ? [runwayX, WORLD.runwayHeight + 4, runwayZ]
       : (state.rings[state.ringIndex] ? state.rings[state.ringIndex].position : null);
+    if (state.mode === MODE.DOGFIGHT) {
+      target = null;
+      let bestDist = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.alive) continue;
+        const d = Math.hypot(
+          enemy.position[0] - f.position[0],
+          enemy.position[1] - f.position[1],
+          enemy.position[2] - f.position[2]);
+        if (d < bestDist) { bestDist = d; target = enemy.position; }
+      }
+    }
     const playerPoint = radarPoint(f.position, cx, cy, r);
     if (target) {
       const tp = radarPoint(target, cx, cy, r);
@@ -1307,7 +1772,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       hud.setLineDash([]);
     }
     for (const ring of state.rings) {
-      if (ring.passed) continue;
+      if (ring.passed || state.mode === MODE.DOGFIGHT) continue;
       const rp = radarPoint(ring.position, cx, cy, r);
       const isNext = ring.index - 1 === state.ringIndex;
       hud.fillStyle = isNext ? '#ffd777' : 'rgba(105,232,245,.75)';
@@ -1450,6 +1915,154 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     }
   }
 
+  // --- flight HUD additions ------------------------------------------------------
+  // The mission layer the sim now carries: the checklist of what this
+  // sortie is for, the tower's radio line, and the resource readouts
+  // (clock, wind, fuel, hull) the new systems run on.
+
+  function formatClock(clock) {
+    const c = clock !== undefined && clock !== null ? clock : CLOCK.start;
+    const h = Math.floor(((c % 24) + 24) % 24);
+    const m = Math.floor((c - Math.floor(c)) * 60);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  }
+
+  function compassPoint(dir) {
+    const names = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const a = ((dir % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    return names[Math.round(a / (Math.PI / 4)) % 8];
+  }
+
+  // A thin rounded bar: dark track, coloured fill, hairline top edge.
+  function statusBar(x, y, w, h, t, color) {
+    hud.fillStyle = 'rgba(6,20,28,.92)';
+    panelPath(x, y, w, h, h / 2);
+    const fill = Math.max(0, Math.min(1, t));
+    if (fill > 0.001) {
+      hud.save();
+      hud.beginPath();
+      hud.rect(x, y, w, h);
+      hud.clip();
+      hud.fillStyle = color;
+      hud.fillRect(x + 1, y + 1, (w - 2) * fill, h - 2);
+      hud.restore();
+    }
+    hud.strokeStyle = 'rgba(140,225,240,.30)';
+    hud.lineWidth = 1;
+    hud.beginPath();
+    hud.moveTo(x + 4, y + 0.5);
+    hud.lineTo(x + w - 4, y + 0.5);
+    hud.stroke();
+  }
+
+  function checklistRows(state) {
+    const rows = [];
+    if (state.mode === MODE.DOGFIGHT) {
+      const alive = state.enemies.reduce((n, e) => n + (e.alive ? 1 : 0), 0);
+      rows.push({ text: `WAVE ${state.dogfight.wave} / ${state.dogfight.waves.length}`, kind: 'current' });
+      rows.push({ text: `BANDITS ${alive}`, kind: alive ? 'current' : 'done' });
+      rows.push({ text: `KILLS ${state.kills}`, kind: state.kills ? 'done' : 'idle' });
+      rows.push({ text: `HULL ${Math.round(state.hull)}%`, kind: state.hull > 25 ? 'idle' : 'danger' });
+      return rows;
+    }
+    const ringsDone = state.ringIndex >= RING_COUNT;
+    const intercept = Math.min(2, state.interceptKills || 0);
+    rows.push({
+      text: 'TAKEOFF',
+      kind: state.mission.tookOff ? 'done' : state.mission.phase === 'takeoff' ? 'current' : 'idle',
+    });
+    rows.push({ text: `RINGS ${Math.min(state.ringIndex, RING_COUNT)} / ${RING_COUNT}`, kind: ringsDone ? 'done' : 'current' });
+    rows.push({
+      text: `INTERCEPT ${intercept} / 2`,
+      kind: intercept >= 2 ? 'done' : state.mission.phase === 'intercept' ? 'current' : 'idle',
+    });
+    rows.push({
+      text: 'LAND & RECOVER',
+      kind: state.mission.completed ? 'done' : state.mission.phase === 'landing' ? 'current' : 'idle',
+    });
+    return rows;
+  }
+
+  // The checklist panel, top-left under the readouts. On touch devices the
+  // left side belongs to the flight pad, so the panel is left off there —
+  // the cockpit panel's phase and objective lines carry the same state.
+  function drawChecklist(state) {
+    if (state.touchUI) return;
+    const rows = checklistRows(state);
+    const x = 28, y = 206, w = 262, rowH = 27;
+    const h = 40 + rows.length * rowH;
+    hud.fillStyle = 'rgba(3,15,22,.60)';
+    panelPath(x, y, w, h, 10);
+    hud.strokeStyle = 'rgba(112,222,238,.26)';
+    hud.lineWidth = 1;
+    hud.stroke();
+    label(state.mode === MODE.DOGFIGHT ? 'DOGFIGHT' : 'SORTIE', x + 16, y + 24, 11, '#8ff3ff', 'left', 700);
+    label(state.mode === MODE.DOGFIGHT ? 'SECTOR CLEAR' : 'MISSION CHECKLIST',
+      x + w - 16, y + 24, 8.5, '#6f9aa4', 'right', 600);
+    rows.forEach((row, i) => {
+      const ry = y + 36 + i * rowH;
+      if (row.kind === 'current') {
+        hud.fillStyle = 'rgba(70,215,238,.09)';
+        hud.fillRect(x + 7, ry, w - 14, rowH - 5);
+      }
+      const color = row.kind === 'done' ? '#8ef2c3'
+        : row.kind === 'current' ? '#dcfbff'
+          : row.kind === 'danger' ? '#ff8072' : '#8fb3ba';
+      const mark = row.kind === 'done' ? '✓' : row.kind === 'current' ? '▶' : '·';
+      label(mark, x + 18, ry + 15, 11, row.kind === 'done' ? '#ffd16f' : color, 'left', 700);
+      label(row.text, x + 34, ry + 15, 11, color, 'left', row.kind === 'current' ? 700 : 500,
+        row.kind === 'current' ? 'rgba(80,230,250,.38)' : null);
+    });
+  }
+
+  // The tower's current line, in a slim bar above the cockpit panel. The
+  // world owns the queue; this only paints state.radio while it lasts,
+  // fading on its own remaining time.
+  function drawRadioLine(state) {
+    const radio = state.radio;
+    if (!radio) return;
+    hud.globalAlpha = Math.min(1, Math.max(0, radio.time * 1.4));
+    hud.fillStyle = 'rgba(3,14,21,.74)';
+    panelPath(360, 546, 560, 31, 7);
+    hud.strokeStyle = 'rgba(255,205,120,.28)';
+    hud.lineWidth = 1;
+    hud.stroke();
+    label(radio.text, 640, 567, 11.5, '#ffe3ae', 'center', 600, 'rgba(2,8,12,.9)');
+    hud.globalAlpha = 1;
+  }
+
+  // Standing warnings, stacked under the centre messages: flameout first,
+  // then fuel, then the airframe.
+  function drawWarnings(state) {
+    const items = [];
+    if (state.flight.engineOut) items.push(['ENGINE FLAMEOUT — GLIDE ONLY', '#ff8d7a']);
+    if (state.fuelBingo) items.push(['BINGO FUEL — RETURN TO RUNWAY', '#ff7d6b']);
+    else if (state.fuelCaution) items.push(['FUEL CAUTION — 30 PERCENT', '#ffce7a']);
+    if (state.hull <= 25 && state.hull > 0) items.push(['HULL CRITICAL — DISENGAGE', '#ff6f60']);
+    items.forEach(([text, color], i) => {
+      label(text, 640, 218 + i * 20, 12, color, 'center', 700, 'rgba(2,10,16,.92)');
+    });
+  }
+
+  // The top-centre banner: what the sky is doing right now — a wave
+  // arriving, an intercept outstanding, or the hose on the aircraft.
+  function drawModeBanner(state) {
+    if (state.refueling) {
+      label('REFUELLING — MISSION PROGRESS HELD', 640, 46, 15, '#9ff7d8', 'center', 700, 'rgba(60,240,180,.4)');
+      label('GEAR DOWN  •  ENGINE IDLE  •  HOLD POSITION', 640, 66, 10.5, '#a9d6cb', 'center', 500);
+      return;
+    }
+    if (state.mode === MODE.DOGFIGHT) {
+      const alive = state.enemies.reduce((n, e) => n + (e.alive ? 1 : 0), 0);
+      label(`WAVE ${state.dogfight.wave} / ${state.dogfight.waves.length}`, 640, 46, 20, '#eafcff', 'center', 700, 'rgba(80,230,250,.45)');
+      label(`${alive} BANDIT${alive === 1 ? '' : 'S'}  •  ${state.kills} KILL${state.kills === 1 ? '' : 'S'}`,
+        640, 66, 10.5, '#9fc9d1', 'center', 500);
+    } else if (state.mission.phase === 'intercept') {
+      const left = Math.max(0, 2 - (state.interceptKills || 0));
+      label(`INTERCEPT — ${left} BANDIT${left === 1 ? '' : 'S'} REMAINING`, 640, 46, 15, '#ffd98c', 'center', 700, 'rgba(255,180,80,.4)');
+    }
+  }
+
   // --- screens -------------------------------------------------------------------
 
   function drawFlightHud(state, vp, camera, cam) {
@@ -1468,15 +2081,47 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     label(`SPD ${String(knots).padStart(3, '0')} kt`, 36, 71, 17, '#d9fbff', 'left', 600, 'rgba(76,230,255,.9)');
     label(`HDG ${String(headingDeg).padStart(3, '0')}°`, 36, 98, 17, '#d9fbff', 'left', 600, 'rgba(76,230,255,.9)');
     label(`RWY ${Math.round(world.runwayDistance(f.position))} m`, 36, 125, 12, '#b9eef6', 'left', 600, 'rgba(70,200,220,.5)');
+    label(`CLOCK ${formatClock(state.clock)}`, 36, 152, 11, '#a8dae3', 'left', 600);
+    label(`WIND ${String(Math.round(state.wind.speed)).padStart(2, '0')} kt ${compassPoint(state.wind.dir + Math.PI)}`,
+      36, 170, 11, '#a8dae3', 'left', 600);
+    hud.save();
+    hud.translate(212, 166);
+    hud.rotate(state.wind.dir + Math.PI);
+    hud.strokeStyle = 'rgba(150,228,240,.8)';
+    hud.lineWidth = 1.2;
+    hud.beginPath();
+    hud.moveTo(-9, 0);
+    hud.lineTo(9, 0);
+    hud.moveTo(9, 0);
+    hud.lineTo(4, -3.5);
+    hud.moveTo(9, 0);
+    hud.lineTo(4, 3.5);
+    hud.stroke();
+    hud.restore();
+
+    drawModeBanner(state);
 
     label(`TIME ${state.time.toFixed(1)}s`, 1244, 44, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
-    label(`RINGS ${Math.min(state.ringIndex, RING_COUNT)}/${RING_COUNT}`, 1244, 71, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
-    label(`MSL ${state.missileCount}`, 1244, 98, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
-    label(`LEFT ${Math.max(0, RING_COUNT - state.ringIndex)}`, 1244, 150, 12, '#b9eef6', 'right', 600, 'rgba(70,200,220,.5)');
-    for (let i = 0; i < RING_COUNT; i++) {
-      hud.fillStyle = i < state.ringIndex ? '#ffc45f'
-        : i === state.ringIndex ? '#8ff7ff' : 'rgba(120,220,235,.24)';
-      hud.fillRect(1128 + i * 13, 112, 8, 4);
+    if (state.mode === MODE.DOGFIGHT) {
+      label(`KILLS ${state.kills}`, 1244, 71, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
+      label(`HULL ${Math.round(state.hull)}%`, 1244, 98, 17,
+        state.hull > 25 ? '#d9fbff' : '#ff8878', 'right', 600, 'rgba(76,230,255,.9)');
+      label(`MSL ${state.missileCount}`, 1244, 125, 12, '#b9eef6', 'right', 600, 'rgba(70,200,220,.5)');
+      for (let i = 0; i < state.dogfight.waves.length; i++) {
+        hud.fillStyle = i < state.dogfight.wave - 1 ? '#ffc45f'
+          : i === state.dogfight.wave - 1 ? '#8ff7ff' : 'rgba(120,220,235,.24)';
+        hud.fillRect(1186 + i * 18, 138, 13, 4);
+      }
+      label('WAVES', 1170, 143, 9, '#8fb8c1', 'right', 600);
+    } else {
+      label(`RINGS ${Math.min(state.ringIndex, RING_COUNT)}/${RING_COUNT}`, 1244, 71, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
+      label(`MSL ${state.missileCount}`, 1244, 98, 17, '#d9fbff', 'right', 600, 'rgba(76,230,255,.9)');
+      label(`LEFT ${Math.max(0, RING_COUNT - state.ringIndex)}`, 1244, 150, 12, '#b9eef6', 'right', 600, 'rgba(70,200,220,.5)');
+      for (let i = 0; i < RING_COUNT; i++) {
+        hud.fillStyle = i < state.ringIndex ? '#ffc45f'
+          : i === state.ringIndex ? '#8ff7ff' : 'rgba(120,220,235,.24)';
+        hud.fillRect(1128 + i * 13, 112, 8, 4);
+      }
     }
 
     drawHorizon(152, 464, 62, f.pitch, f.bank);
@@ -1485,17 +2130,44 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     label(String(feet).padStart(4, '0'), 238, 482, 16, '#ffe3a1', 'left', 700, 'rgba(255,192,95,.4)');
     label('FT', 298, 482, 9, '#8a9d92', 'left', 500);
 
+    drawChecklist(state);
     drawRadar(state, 1146, 226, 62);
 
-    const returning = state.phase === 'return';
-    const nextRing = state.rings[state.ringIndex];
-    const navPoint = returning ? [runwayX, WORLD.runwayHeight + 5, runwayZ] : (nextRing ? nextRing.position : null);
+    // The destination: the nearest bandit in a dogfight, the runway on the
+    // return leg (which the landing phase stays in), else the next ring.
+    const returning = state.mode !== MODE.DOGFIGHT
+      && (state.phase === 'return' || state.mission.phase === 'landing');
+    let navPoint = null;
+    let navText = '';
+    let navColor = '#ffd777';
+    if (state.mode === MODE.DOGFIGHT) {
+      let best = null;
+      let bestDist = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.alive) continue;
+        const d = Math.hypot(
+          enemy.position[0] - f.position[0],
+          enemy.position[1] - f.position[1],
+          enemy.position[2] - f.position[2]);
+        if (d < bestDist) { bestDist = d; best = enemy; }
+      }
+      if (best) {
+        navPoint = best.position;
+        navText = `BANDIT  ${Math.round(bestDist)}m`;
+        navColor = '#ff8b7c';
+      }
+    } else if (returning) {
+      navPoint = [runwayX, WORLD.runwayHeight + 5, runwayZ];
+      navText = `RWY  ${Math.round(world.runwayDistance(f.position))}m`;
+    } else if (state.rings[state.ringIndex]) {
+      navPoint = state.rings[state.ringIndex].position;
+      navText = `RING ${state.ringIndex + 1}  ${Math.round(Math.hypot(
+        navPoint[0] - f.position[0], navPoint[1] - f.position[1], navPoint[2] - f.position[2]))}m`;
+    }
     const navDist = navPoint ? Math.round(Math.hypot(
       navPoint[0] - f.position[0], navPoint[1] - f.position[1], navPoint[2] - f.position[2])) : 0;
     if (navPoint) {
-      drawNavMarker(vp, camera, cam, navPoint,
-        returning ? `RWY  ${navDist}m` : `RING ${nextRing.index}  ${navDist}m`,
-        '#ffd777', returning);
+      drawNavMarker(vp, camera, cam, navPoint, navText, navColor, returning);
     }
     if (returning) {
       label(`RETURN TO RUNWAY  ${navDist}m`, 640, 150, 16, '#ffe1a5', 'center', 700, 'rgba(255,195,98,.45)');
@@ -1525,10 +2197,17 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       }
     }
 
+    drawWarnings(state);
+
     if (state.messageTime > 0 && state.message) {
       hud.globalAlpha = Math.min(1, state.messageTime * 2.2);
       label(state.message, 640, 128, 14, '#d8fbff', 'center', 700, 'rgba(90,234,255,.55)');
       hud.globalAlpha = 1;
+    }
+
+    if (state.refueling) {
+      label(`REFUELING  ${Math.round(state.fuel)}%`, 640, 506, 13, '#9ff7d8', 'center', 700, 'rgba(60,240,180,.4)');
+      statusBar(490, 514, 300, 8, state.fuel / 100, '#6ff0c0');
     }
 
     // The cockpit panel: a dark trapezoid across the bottom carrying the
@@ -1568,18 +2247,42 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
 
     drawGauge(112, 660, 42, f.speed / 245, 'SPD', 'KNOTS');
     drawGauge(1168, 660, 42, (f.position[1] - WORLD.seaLevel) / 700, 'ALT', 'FEET');
-    drawGauge(232, 664, 31, f.throttle, 'THR', '%');
-    drawGauge(1048, 664, 31, f.gear, 'GEAR', f.gear > 0.88 ? 'DOWN' : f.gear < 0.12 ? 'UP' : 'MOVING');
-    label('SKY RING', 640, 628, 16, '#d6f7fc', 'center', 700, 'rgba(83,230,248,.5)');
-    label(returning ? 'RETURN LEG' : 'COURSE ACTIVE', 640, 647, 10, '#7fa6ad', 'center', 500);
+    drawGauge(232, 664, 31, f.throttle, 'THR', f.engineOut ? 'OUT' : '%');
+    drawGauge(1000, 664, 31, state.fuel / 100, 'FUEL',
+      state.fuelBingo ? 'BINGO' : state.fuelCaution ? 'LOW' : '%');
+    drawGauge(1088, 664, 31, f.gear, 'GEAR', f.gear > 0.88 ? 'DOWN' : f.gear < 0.12 ? 'UP' : 'MOVING');
+
+    const phaseText = state.mode === MODE.DOGFIGHT
+      ? `WAVE ${state.dogfight.wave} / ${state.dogfight.waves.length}`
+      : state.mission.phase === 'takeoff' ? 'TAKEOFF'
+        : state.mission.phase === 'rings' ? `RINGS ${Math.min(state.ringIndex, RING_COUNT)} / ${RING_COUNT}`
+          : state.mission.phase === 'intercept' ? 'INTERCEPT'
+            : state.mission.phase === 'landing' ? 'FINAL APPROACH' : 'COMPLETE';
+    label(`${state.mode === MODE.DOGFIGHT ? 'DOGFIGHT' : 'SORTIE'}  •  ${phaseText}`,
+      640, 616, 11, '#a9dbe4', 'center', 700);
+    const hullColor = state.hull > 60 ? '#67e8b0' : state.hull > 25 ? '#ffcf6b' : '#ff6b5c';
+    label('HULL', 490, 637, 8.5, '#7fa6ad', 'right', 600);
+    statusBar(500, 628, 280, 9, state.hull / state.hullMax, hullColor);
+    label(`${Math.round(state.hull)}%`, 790, 637, 8.5, '#bfe6ec', 'left', 600);
+    const objective = state.mode === MODE.DOGFIGHT
+      ? `${state.enemies.reduce((n, e) => n + (e.alive ? 1 : 0), 0)} BANDITS IN SECTOR — CLEAR ALL WAVES`
+      : state.mission.phase === 'takeoff' ? 'THROTTLE UP • ROTATE AT 120 KT'
+        : state.mission.phase === 'rings' ? `NEXT GATE  RING ${Math.min(state.ringIndex + 1, RING_COUNT)}`
+          : state.mission.phase === 'intercept' ? `SPLASH ${Math.min(2, state.interceptKills || 0)} OF 2 BANDITS`
+            : state.mission.phase === 'landing' ? 'RUNWAY 36 — GEAR DOWN, SLOW TO 120 KT'
+              : 'ALL OBJECTIVES COMPLETE';
+    label(objective, 640, 655, 9.5, '#7fb6c0', 'center', 500);
     label('↑ CLIMB   ↓ DIVE   ←→ BANK / TURN   W/S THROTTLE   G GEAR   J/F FIRE   R RECOVER',
-      640, 690, 11, '#8fb2b8', 'center', 500);
+      640, 686, 10, '#8fb2b8', 'center', 500);
+    label(`MSL ${state.missileCount}`, 880, 640, 11,
+      state.missileCount > 0 ? '#bfe6ec' : '#ff8e80', 'center', 700);
     if (state.lock && state.lock.alive && state.lockTime > 0.55) {
-      label('MISSILE LOCK — FIRE', 830, 660, 11, '#ff8e80', 'center', 700, 'rgba(255,90,70,.5)');
+      label('LOCK — FIRE', 880, 655, 9, '#ff8e80', 'center', 700, 'rgba(255,90,70,.5)');
     } else {
-      label(state.missileCount > 0 ? 'ARMED' : 'EMPTY', 830, 660, 11, '#7fa6ad', 'center', 600);
+      label(state.missileCount > 0 ? 'ARMED' : 'EMPTY', 880, 655, 9, '#7fa6ad', 'center', 600);
     }
 
+    drawRadioLine(state);
     if (state.touchUI) drawTouchControls(state);
   }
 
@@ -1611,11 +2314,13 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     hud.lineTo(842, 194);
     hud.stroke();
     label('AN ORIGINAL STYLIZED FLIGHT', 640, 222, 13, '#e2fbff', 'center', 600, 'rgba(1,8,14,.85)');
-    label('FLY THE NINE RINGS.  RETURN TO THE RUNWAY.', 640, 250, 12, '#d6f2f8', 'center', 500, 'rgba(1,8,14,.85)');
-    label('CHASE VIEW  •  PBR SEA & METAL  •  OFFLINE', 640, 286, 10, '#b9dce4', 'center', 500, 'rgba(1,8,14,.85)');
+    label('SORTIE — NINE RINGS • INTERCEPT • BRING HER HOME', 640, 250, 12, '#d6f2f8', 'center', 500, 'rgba(1,8,14,.85)');
+    label('DOGFIGHT — THREE WAVES • THE BANDITS SHOOT BACK', 640, 272, 12, '#ffd9b0', 'center', 500, 'rgba(1,8,14,.85)');
+    label('CHASE VIEW  •  PBR SEA & METAL  •  OFFLINE', 640, 298, 10, '#b9dce4', 'center', 500, 'rgba(1,8,14,.85)');
 
-    // The two main buttons must stay inside the input layer's hit boxes:
-    // start x 398..632, credits x 648..882, both y 512..564.
+    // The three main buttons must stay inside the input layer's hit boxes:
+    // sortie x 273..507, dogfight x 523..757, credits x 773..1007, all
+    // y 512..564.
     const by = 512;
     const menuButton = (text, x, w, hovered) => {
       hud.fillStyle = hovered ? 'rgba(75,213,236,.20)' : 'rgba(7,24,35,.78)';
@@ -1632,10 +2337,12 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       label(text, x + w / 2, by + 33, 14, hovered ? '#ecfeff' : '#b9e9ef', 'center', 700,
         hovered ? 'rgba(100,240,255,.55)' : null);
     };
-    menuButton('ENTER  —  SORTIE', 398, 234,
-      pointer.x > 398 && pointer.x < 632 && pointer.y > by && pointer.y < by + 52);
-    menuButton('C  —  CREDITS', 648, 234,
-      pointer.x > 648 && pointer.x < 882 && pointer.y > by && pointer.y < by + 52);
+    menuButton('ENTER  —  SORTIE', 273, 234,
+      pointer.x > 273 && pointer.x < 507 && pointer.y > by && pointer.y < by + 52);
+    menuButton('D  —  DOGFIGHT', 523, 234,
+      pointer.x > 523 && pointer.x < 757 && pointer.y > by && pointer.y < by + 52);
+    menuButton('C  —  CREDITS', 773, 234,
+      pointer.x > 773 && pointer.x < 1007 && pointer.y > by && pointer.y < by + 52);
 
     const audioHovered = pointer.x > 548 && pointer.x < 732 && pointer.y > 578 && pointer.y < 614;
     hud.fillStyle = audioHovered ? 'rgba(75,213,236,.22)' : 'rgba(7,24,35,.72)';
@@ -1680,6 +2387,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       ['AUDIO', ''],
       ['G08-25_4-E Jet Constant Noise', 'by craigsmith (CC0) — https://freesound.org/people/craigsmith/sounds/437888/'],
       ['Rocket Launch', 'by gracenew (CC0) — https://freesound.org/people/gracenew/sounds/857959/'],
+      ['Machine Gun Burst', 'by qubodup (CC0) — https://freesound.org/people/qubodup/sounds/482121/'],
       ['Sci-Fi_Explosion_2', 'by Anomaex (CC0) — https://freesound.org/people/Anomaex/sounds/490266/'],
       ['Lock on (Sci-Fi UI SFX Free)', 'by heyheytheree (CC BY 4.0) — https://freesound.org/people/heyheytheree/sounds/872714/'],
       ['', 'license: https://creativecommons.org/licenses/by/4.0/'],
@@ -1689,7 +2397,7 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       ['Explosion sprite (orange recolor)', 'by Aj_ (CC0) — https://opengameart.org/content/explosion-sprite'],
       ['Smoke particles', 'by Kenney (CC0) — https://kenney.nl'],
     ];
-    let y = 162;
+    let y = 150;
     for (const [left, right] of rows) {
       const isHeader = left !== '' && right === '';
       if (isHeader) {
@@ -1785,38 +2493,74 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
   }
 
   function drawResultScreen(state) {
+    // The world hands over a result object when a run ends; the staged
+    // result scene predates it, so fall back to the loose state fields
+    // (which is also all a mid-build save would have).
+    const res = state.result || {
+      victory: true,
+      mode: state.mode,
+      time: state.time,
+      kills: state.kills,
+      hull: state.hull,
+      waves: state.dogfight.wave,
+      landing: state.landing || null,
+      score: state.score,
+      reason: '',
+    };
+    const dogfight = res.mode === MODE.DOGFIGHT;
+    const victory = res.victory !== false;
+    const title = dogfight
+      ? (victory ? 'DOGFIGHT CLEARED' : 'AIRFRAME LOST')
+      : (victory ? 'MISSION COMPLETE' : 'AIRFRAME LOST');
     hud.fillStyle = 'rgba(2,9,16,.76)';
     hud.fillRect(0, 0, VIEW.width, VIEW.height);
     hud.fillStyle = 'rgba(6,20,31,.92)';
-    panelPath(250, 92, 780, 530, 12);
-    hud.strokeStyle = 'rgba(255,205,122,.55)';
+    panelPath(250, 86, 780, 548, 12);
+    hud.strokeStyle = victory ? 'rgba(255,205,122,.55)' : 'rgba(255,120,95,.55)';
     hud.lineWidth = 2;
     hud.beginPath();
-    hud.moveTo(250, 168);
-    hud.lineTo(1030, 168);
+    hud.moveTo(250, 166);
+    hud.lineTo(1030, 166);
     hud.stroke();
-    label('FLIGHT COMPLETE', 640, 150, 38, '#ffedc9', 'center', 800, 'rgba(255,180,70,.45)');
-    label('RUNWAY SECURED  •  AIRCRAFT RECOVERED', 640, 196, 11, '#9dc4ca', 'center', 600);
-    const rows = [
-      ['TIME', `${state.time.toFixed(1)} s`],
+    label(title, 640, 148, dogfight ? 34 : 36, victory ? '#ffedc9' : '#ffb3a4', 'center', 800,
+      victory ? 'rgba(255,180,70,.45)' : 'rgba(255,80,60,.45)');
+    const subtitle = dogfight
+      ? (victory ? `ALL ${res.waves} WAVES CLEARED  •  SKY SECURED` : 'HULL 0  •  SHOT DOWN')
+      : (victory ? 'RUNWAY SECURED  •  AIRCRAFT RECOVERED' : (res.reason || state.crashReason || 'SHOT DOWN'));
+    label(subtitle, 640, 192, 10.5, victory ? '#9dc4ca' : '#e2a99e', 'center', 600);
+    label(dogfight ? 'DOGFIGHT' : 'SORTIE', 1004, 118, 9, '#7fa6ae', 'right', 700);
+    const rows = dogfight ? [
+      ['KILLS', String(res.kills !== undefined && res.kills !== null ? res.kills : state.kills)],
+      ['WAVES', `${res.waves !== undefined && res.waves !== null ? res.waves : state.dogfight.wave} / ${state.dogfight.waves.length}`],
+      ['TIME', `${res.time.toFixed(1)} s`],
+      ['HULL', `${Math.round(res.hull !== undefined && res.hull !== null ? res.hull : state.hull)} %`],
+      ['SCORE', String(res.score !== undefined && res.score !== null ? res.score : state.score)],
+    ] : [
+      ['TIME', `${res.time.toFixed(1)} s`],
       ['RINGS', `${state.ringIndex} / ${RING_COUNT}`],
-      ['KILLS', String(state.kills)],
-      ['LANDING', state.flight.landingScore],
-      ['SCORE', String(state.score)],
+      ['KILLS', String(res.kills !== undefined && res.kills !== null ? res.kills : state.kills)],
+      ['LANDING', (res.landing && res.landing.grade) || state.flight.landingScore],
+      ['SCORE', String(res.score !== undefined && res.score !== null ? res.score : state.score)],
     ];
     rows.forEach(([key, value], i) => {
-      const y = 264 + i * 46;
+      const y = 244 + i * 44;
       const isScore = i === rows.length - 1;
-      label(key, 430, y, 15, '#85b8c1', 'left', 600);
-      label(value, 840, y, isScore ? 27 : 22, isScore ? '#ffe19b' : '#eafcff', 'right', 700,
+      label(key, 420, y, 15, '#85b8c1', 'left', 600);
+      label(value, 860, y, isScore ? 27 : 22,
+        isScore ? '#ffe19b' : (key === 'LANDING' ? '#ffd98c' : '#eafcff'), 'right', 700,
         isScore ? 'rgba(255,190,80,.4)' : null);
     });
     hud.strokeStyle = 'rgba(120,210,225,.2)';
     hud.beginPath();
-    hud.moveTo(390, 480);
-    hud.lineTo(890, 480);
+    hud.moveTo(390, 448);
+    hud.lineTo(890, 448);
     hud.stroke();
-    drawEndButtons('ENTER  —  FLY AGAIN');
+    if (!dogfight && res.landing) {
+      const l = res.landing;
+      label(`SINK ${Number(l.sink).toFixed(1)} m/s     CENTER ${Number(l.center).toFixed(1)} m     SPEED ${Math.round(l.speed)} kt`,
+        640, 476, 11, '#a9cdd4', 'center', 500);
+    }
+    drawEndButtons(victory ? 'ENTER  —  FLY AGAIN' : 'ENTER  —  TRY AGAIN');
   }
 
   function drawCrashScreen(state) {
@@ -1840,7 +2584,30 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     hud.scale(width / VIEW.width, height / VIEW.height);
     const overlay = state.phase === 'title' || state.phase === 'credits'
       || state.phase === 'settings' || state.phase === 'result' || state.phase === 'crashed';
-    if (!overlay) drawFlightHud(state, vp, camera, cam);
+    if (!overlay) {
+      // Battle damage reads at the edges of the vision first: the flash
+      // the world raises on a hit, and a slow pulse while the hull is
+      // critical. Both are pure functions of state, so staged frames and
+      // the post pass's own vignette stay in step.
+      if (state.damageFlash > 0.01) {
+        const a = Math.min(0.62, state.damageFlash * 0.62);
+        const dg = hud.createRadialGradient(640, 320, 110, 640, 320, 700);
+        dg.addColorStop(0, `rgba(190,30,18,${a * 0.20})`);
+        dg.addColorStop(0.68, `rgba(180,24,14,${a * 0.42})`);
+        dg.addColorStop(1, `rgba(110,8,5,${a})`);
+        hud.fillStyle = dg;
+        hud.fillRect(0, 0, VIEW.width, VIEW.height);
+      }
+      if (state.hull <= 25 && state.hull > 0) {
+        const pulse = 0.18 + (0.5 + 0.5 * Math.sin(state.time * 5.4)) * 0.18;
+        const eg = hud.createRadialGradient(640, 350, 250, 640, 350, 720);
+        eg.addColorStop(0, 'rgba(160,16,8,0)');
+        eg.addColorStop(1, `rgba(150,12,6,${pulse})`);
+        hud.fillStyle = eg;
+        hud.fillRect(0, 0, VIEW.width, VIEW.height);
+      }
+      drawFlightHud(state, vp, camera, cam);
+    }
     if (state.phase === 'title') drawTitleScreen();
     else if (state.phase === 'credits') drawCreditsScreen();
     else if (state.phase === 'settings') drawSettingsScreen(state);
@@ -1865,15 +2632,21 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     }
     const fwd = world.forward();
     const distance = 46 + Math.min(18, f.speed * 0.045);
+    // Battle damage shakes the camera: two fast sines off state.time (so a
+    // staged frame is still exact), scaled by the world's shake cue, with
+    // the target following at half strength so the airframe stays framed.
+    const shake = state.shake || 0;
+    const sx = Math.sin(state.time * 47.2) * shake * 1.7;
+    const sy = Math.cos(state.time * 61.7) * shake * 1.3;
     return {
       position: [
-        f.position[0] - fwd[0] * distance,
-        f.position[1] + 10 + fwd[1] * 4,
+        f.position[0] - fwd[0] * distance + sx,
+        f.position[1] + 10 + fwd[1] * 4 + sy,
         f.position[2] - fwd[2] * distance,
       ],
       target: [
-        f.position[0] + fwd[0] * 58,
-        f.position[1] + 2 + fwd[1] * 4,
+        f.position[0] + fwd[0] * 58 + sx * 0.45,
+        f.position[1] + 2 + fwd[1] * 4 + sy * 0.45,
         f.position[2] + fwd[2] * 58,
       ],
       up: [Math.sin(f.bank) * 0.55, Math.cos(f.bank) * 0.55, 0.04],
@@ -1892,13 +2665,20 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     const time = state.time;
     const f = state.flight;
 
+    // The frame's light is settled first: the environment from the clock,
+    // then the shadow map it lights (which hands its matrix back through
+    // env for the scene shader to sample).
+    env = computeEnvironment(state);
+    renderShadowPass(state);
+
     gl.useProgram(program);
     gl.bindFramebuffer(gl.FRAMEBUFFER, sceneTarget ? sceneTarget.fbo : null);
+    gl.viewport(0, 0, width, height);
     gl.disable(gl.BLEND);
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
     gl.depthMask(true);
-    gl.clearColor(PALETTE.fog[0], PALETTE.fog[1], PALETTE.fog[2], 1);
+    gl.clearColor(env.fog[0], env.fog[1], env.fog[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     // The sky dome follows the camera and neither reads nor writes depth.
@@ -1916,13 +2696,13 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     if (terrainGeometry) {
       drawMesh(terrainGeometry,
         { ...terrainGeometry.material, color: [0.82, 0.9, 0.78], metallic: 0.02, roughness: 0.94 },
-        identity(), vp, camera, time, { terrain: true, doubleSided: true });
+        identity(), vp, camera, time, { terrain: true, doubleSided: true, shadow: true });
     }
     drawMesh(runwaySlab, { color: [0.11, 0.13, 0.15], metallic: 0.22, roughness: 0.68 },
-      runwayModel, vp, camera, time);
+      runwayModel, vp, camera, time, { shadow: true });
     drawMesh(runwayPaint, { color: [0.94, 0.86, 0.63], metallic: 0.08, roughness: 0.5, emissive: 0.06 },
-      runwayModel, vp, camera, time);
-    drawMesh(runwayLights, { color: [1.0, 0.62, 0.24], metallic: 0, roughness: 0.4, emissive: 1.6 },
+      runwayModel, vp, camera, time, { shadow: true });
+    drawMesh(runwayLights, { color: [1.0, 0.62, 0.24], metallic: 0, roughness: 0.4, emissive: 0.35 + env.night * 1.5 },
       runwayModel, vp, camera, time);
     drawMesh(treeTrunks, { color: [0.22, 0.16, 0.11], metallic: 0, roughness: 0.95 },
       identity(), vp, camera, time);
@@ -1930,8 +2710,9 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       identity(), vp, camera, time);
 
     // The ring course; the next gate pulses gold, the rest stay cyan.
+    // A dogfight has no course to fly, so the gates stay home.
     for (let i = 0; i < world.rings.length; i++) {
-      if (state.rings[i].passed || state.phase === 'title') continue;
+      if (state.mode === MODE.DOGFIGHT || state.rings[i].passed || state.phase === 'title') continue;
       const isNext = i === state.ringIndex;
       const pulse = isNext ? 0.82 + Math.sin(time * 4.2) * 0.18 : 0.5;
       const base = isNext ? [1.0, 0.78, 0.34] : [0.22, 0.78, 0.86];
@@ -1950,10 +2731,21 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     for (const wreck of state.wrecks) drawWreck(wreck, vp, camera, time);
 
     // The hovering target diamond, drawn through the terrain so the goal is
-    // never hidden behind a ridge.
-    const navPoint = state.phase === 'return'
-      ? [runwayX, WORLD.runwayHeight + 30, runwayZ]
-      : (state.rings[state.ringIndex] ? state.rings[state.ringIndex].position : null);
+    // never hidden behind a ridge: gold for the course and the runway, red
+    // over the nearest bandit in a dogfight.
+    let navPoint = null;
+    if (state.mode === MODE.DOGFIGHT) {
+      let bestDist = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.alive) continue;
+        const d = length(sub(enemy.position, f.position));
+        if (d < bestDist) { bestDist = d; navPoint = enemy.position; }
+      }
+    } else if (state.phase === 'return') {
+      navPoint = [runwayX, WORLD.runwayHeight + 30, runwayZ];
+    } else if (state.rings[state.ringIndex]) {
+      navPoint = state.rings[state.ringIndex].position;
+    }
     const navScreen = navPoint ? project(navPoint, vp) : null;
     if (navPoint && navScreen
       && navScreen.x > -80 && navScreen.x < VIEW.width + 80
@@ -1962,7 +2754,10 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       const bob = Math.sin(time * 3) * 1.8;
       gl.disable(gl.DEPTH_TEST);
       drawMesh(navDiamond,
-        { color: [1.0, 0.80, 0.36], metallic: 0.4, roughness: 0.3, emissive: 1.0 },
+        {
+          color: state.mode === MODE.DOGFIGHT ? [1.0, 0.42, 0.30] : [1.0, 0.80, 0.36],
+          metallic: 0.4, roughness: 0.3, emissive: 1.0,
+        },
         multiply(translation(navPoint[0], navPoint[1] + 36 + bob, navPoint[2]), scaling(1.5, 1.5, 1.5)),
         vp, camera, time, { doubleSided: true });
       gl.enable(gl.DEPTH_TEST);
@@ -1973,6 +2768,75 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
       drawMesh(missileBody, { color: [0.82, 0.80, 0.76], metallic: 0.7, roughness: 0.28, emissive: 0.05 },
         headingMatrix(m.position, m.velocity, 1.15), vp, camera, time);
     }
+
+    // Additive lamp pass: everything that glows rather than reflects.
+    // The runway and approach lamps wake up as the light fails; the
+    // aircraft's own lamps, burner and vapour ride along at every hour,
+    // and the enemy's tracers are two sprites a round — head and tail.
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    gl.depthMask(false);
+    const nightGlow = clamp01(env.night * 1.15 + 0.10);
+    const lampPulse = 0.72 + 0.28 * Math.sin(time * 3.1);
+    for (const spot of runwayGlowSpots) {
+      const color = spot[3] === 1 ? [1.0, 0.14, 0.09] : spot[3] === 0 ? [0.16, 1.0, 0.38] : [1.0, 0.92, 0.76];
+      glowSprite([runwayX + spot[0], spot[1], runwayZ + spot[2]],
+        spot[3] === 2 ? 4.4 : 3.6, color, nightGlow * 0.85 * lampPulse, camera, vp, time, 1.15);
+    }
+    for (let i = 0; i < approachGlowSpots.length; i++) {
+      const spot = approachGlowSpots[i];
+      const chase = (Math.floor(time * 2.4) % 3) === (i % 3) ? 1 : 0.32;
+      glowSprite([runwayX + spot[0], spot[1], runwayZ + spot[2]],
+        3.4, [1.0, 0.95, 0.82], nightGlow * 0.8 * chase, camera, vp, time, 1.15);
+    }
+    if (state.phase !== 'crashed') {
+      const tipA = aircraftPoint(f, [-8.6, 0.5, 0.5]);
+      const tipB = aircraftPoint(f, [8.6, 0.5, 0.5]);
+      glowSprite(tipA, 2.2, [0.16, 1.0, 0.38], 0.55 + nightGlow * 0.3, camera, vp, time, 1.2);
+      glowSprite(tipB, 2.2, [1.0, 0.14, 0.09], 0.55 + nightGlow * 0.3, camera, vp, time, 1.2);
+      const strobe = (time % 1.15) < 0.07 ? 1.0 : 0.0;
+      glowSprite(aircraftPoint(f, [0, 1.7, -9.5]), 1.6, [1, 1, 1],
+        0.05 + nightGlow * 0.75 * strobe, camera, vp, time, 1.3);
+      if (f.gear > 0.5) {
+        glowSprite(aircraftPoint(f, [0, -0.5, 10.5]), 3.2, [1.0, 0.95, 0.82],
+          0.20 + nightGlow * 0.25, camera, vp, time, 1.1);
+      }
+      if (!f.engineOut && f.throttle > 0.70) {
+        const power = (f.throttle - 0.70) / 0.30;
+        const flicker = 0.72 + 0.28 * Math.sin(time * 37.0);
+        const burnerVis = 0.32 + nightGlow * 0.68;
+        const tail = aircraftPoint(f, [0, 0, -9.6]);
+        glowSprite(tail, 3.2 + power * 3.6, [1.0, 0.52, 0.18],
+          (0.20 + power * 0.38) * flicker * burnerVis, camera, vp, time, 1.15);
+        const back = world.forward();
+        glowSprite(
+          [tail[0] - back[0] * 3, tail[1] - back[1] * 3, tail[2] - back[2] * 3],
+          5.0 + power * 5.2, [1.0, 0.32, 0.10],
+          (0.10 + power * 0.20) * flicker * burnerVis, camera, vp, time, 1.15);
+      }
+      const loadFactor = Math.max(Math.abs(f.bank) - 0.50, 0) * 2.0
+        + Math.max(Math.abs(f.pitch) - 0.20, 0) * 1.1;
+      if (f.speed > 115 && loadFactor > 0.02) {
+        const vapour = clamp01(loadFactor) * 0.28;
+        glowSprite(tipA, 3.4, [0.92, 0.97, 1.0], vapour, camera, vp, time, 0.18);
+        glowSprite(tipB, 3.4, [0.92, 0.97, 1.0], vapour, camera, vp, time, 0.18);
+      }
+    }
+    for (const enemy of state.enemies) {
+      if (enemy.alive && state.phase !== 'title') {
+        glowSprite(enemy.position, 2.0, [1.0, 0.20, 0.14], 0.4 + nightGlow * 0.3, camera, vp, time, 1.2);
+      }
+    }
+    for (const b of state.bullets) {
+      glowSprite(b.position, 2.4, [1.0, 0.74, 0.28], 0.9, camera, vp, time, 1.2);
+      glowSprite(
+        [b.position[0] - b.velocity[0] * 0.014,
+          b.position[1] - b.velocity[1] * 0.014,
+          b.position[2] - b.velocity[2] * 0.014],
+        3.8, [1.0, 0.42, 0.12], 0.32, camera, vp, time, 1.2);
+    }
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
 
     // Blended layer: the contact shadow, clouds, smoke, missile glare and
     // explosion flipbooks, back to front in list order, depth write off.
@@ -1994,8 +2858,10 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
         shadowModel, vp, camera, time, { blended: true });
     }
 
-    drawMesh(cloudBank, { color: [0.96, 0.98, 1.0], metallic: 0, roughness: 1, opacity: 0.17, emissive: 0.3 },
-      identity(), vp, camera, time, { blended: true });
+    const cloudColor = mix3([0.97, 0.98, 1.0], [0.10, 0.13, 0.20], env.night);
+    drawMesh(cloudBank,
+      { color: cloudColor, metallic: 0, roughness: 1, opacity: 0.34, emissive: 0.12 * (1 - env.night) },
+      identity(), vp, camera, time, { blended: true, cloud: true });
 
     for (const p of state.particles) {
       const fade = Math.max(0, Math.min(0.78, 0.78 * (1 - p.age / p.life)));
@@ -2034,7 +2900,8 @@ export function createRenderer(glCanvas, hudCanvas, world, options = {}) {
     const blurStrength = (state.phase === 'play' || state.phase === 'return')
       ? blurSetting * speedFactor * 0.026 * (1 + Math.abs(f.bank) * 0.35)
       : 0;
-    presentScene(blurStrength);
+    const vignette = 0.34 + env.night * 0.14 + Math.min(0.3, (state.damageFlash || 0) * 0.30);
+    presentScene(blurStrength, time, vignette);
 
     drawHud(state, vp, camera, cam);
   }
