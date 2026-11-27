@@ -110,3 +110,72 @@ export const AUDIO = {
   ring: 'audio/ring.ogg',
   jingle: 'audio/jingle.ogg',
 };
+
+// --- Modes, resources and the clock -----------------------------------------
+
+/** The two ways to fly: the phased sortie and the pure air-combat mode. */
+export const MODE = { SORTIE: 'sortie', DOGFIGHT: 'dogfight' };
+
+// Fuel, in tank percent. The burn is deliberately generous: a clean lap of
+// the nine rings, the two-bandit intercept and the return leg uses roughly
+// half a tank, so the pressure only shows when a player keeps chasing or
+// takes a long detour. Refuelling happens on the runway (see world.js).
+export const FUEL = {
+  max: 100,
+  idleBurn: 0.040,      // percent per second at idle throttle
+  throttleBurn: 0.300,  // extra percent per second at full throttle (throttle^2)
+  caution: 30,          // percent: first tower warning
+  bingo: 15,            // percent: bingo call — come home now
+  refuelRate: 26,       // percent per second with the hose on
+  refuelSpeed: 5,       // below this ground speed the hose stays connected
+};
+
+// Per-sortie wind, knots. The direction is hashed from the run seed, so a
+// seed always flies in the same weather.
+export const WIND = { maxKnots: 15 };
+
+// The in-game clock, in hours. It runs at one game minute per real second,
+// so a sortie that leaves in the afternoon is landing near dusk and a long
+// dogfight runs into the night. `title` is where the menu backdrop sits.
+export const CLOCK = {
+  start: 14.0,          // SORTIE wheels-up time: mid-afternoon
+  dogfightStart: 17.35, // DOGFIGHT starts in the early evening
+  rate: 1 / 60,         // hours of game time per real second
+  title: 13.4,
+};
+
+// Air combat. Waves arrive in the listed sizes; the player starts airborne
+// over the southern channel, already at fighting speed.
+export const DOGFIGHT = {
+  waves: [2, 3, 4],
+  start: [420, 470, -760],
+  heading: 0.12,
+  speed: 172,
+  waveDelay: 3.2,     // seconds between a wave clearing and the next arriving
+  victoryDelay: 2.4,  // a beat of quiet sky before the victory card
+  bulletSpeed: 620,
+  maxRange: 720,
+};
+
+// What a touchdown may look like and still count as a landing. Anything
+// outside these is a crash, and the grade (world.js) scores what is inside.
+export const LANDING = {
+  maxSpeed: 92,
+  maxPitch: 0.17,
+  maxBank: 0.2,
+  maxSink: 12,
+};
+
+// Enemy behaviour, split by how hard the bandits are trying: the dogfight
+// waves press home, the sortie interceptors are a gentler introduction to
+// being shot at. Damage is rolled per bullet at the moment it is fired.
+export const ENEMY = {
+  dogfightSpeed: 178,
+  sortieSpeed: 162,
+  dogfightTurn: 1.05,   // radians per second of heading change
+  sortieTurn: 0.72,
+  dogfightRange: 720,   // metres; guns open inside this
+  sortieRange: 620,
+  dogfightDamage: [4.5, 9.5],
+  sortieDamage: [3.0, 7.0],
+};
