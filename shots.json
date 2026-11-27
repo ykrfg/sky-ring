@@ -1,6 +1,6 @@
 [
-  { "name": "1-missile.jpg", "query": "?scene=missile&seed=1" },
-  { "name": "2-ring.jpg", "query": "?scene=ring&seed=1" },
-  { "name": "3-landing.jpg", "query": "?scene=landing&seed=1" },
+  { "name": "1-dogfight.jpg", "query": "?scene=dogfight&seed=1" },
+  { "name": "2-landing.jpg", "query": "?scene=landing&seed=1" },
+  { "name": "3-ring.jpg", "query": "?scene=ring&seed=1" },
   { "name": "4-title.jpg", "query": "?scene=title&seed=1" }
 ]
