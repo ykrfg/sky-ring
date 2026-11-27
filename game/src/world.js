@@ -602,6 +602,10 @@ export function createWorld(terrain, random) {
     state.dogfight.waveDelay = 0;
     state.dogfight.victoryDelay = 0;
     state.dogfight.cleared = false;
+    // A fresh wave means a fresh rack: the three waves field nine bandits
+    // against six rails, so without a restock between waves the last wave
+    // could never be cleared and the mode could never be won.
+    if (wave > 1) state.missileCount = MISSILE_STOCK;
     spawnCombat(counts[state.dogfight.wave - 1], true);
     pushRadio(`TOWER: WAVE ${state.dogfight.wave} — ${counts[state.dogfight.wave - 1]} BANDITS INBOUND.`, 4.6);
   }
@@ -971,6 +975,9 @@ export function createWorld(terrain, random) {
         state.refueling = false;
         state.fuel = FUEL.max;
         flight.engineOut = false;
+        // The ground crew rearms while the hose is on: a sortie that spent
+        // its racks and came home is not done flying the intercept.
+        state.missileCount = MISSILE_STOCK;
         pushRadio('TOWER: FUEL FULL. READY WHEN YOU ARE.', 3.2);
       }
     } else {
